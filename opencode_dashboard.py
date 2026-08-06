@@ -330,8 +330,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .mono{font-family:var(--mono)}
 
 /* top bar */
-.topbar{position:sticky;top:0;z-index:40;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  background:color-mix(in srgb,var(--bg) 82%,transparent);border-bottom:1px solid var(--line)}
+.topbar{position:sticky;top:0;z-index:40;background:var(--bg);border-bottom:1px solid var(--line)}
 .topbar-in{max-width:1080px;margin:0 auto;padding:12px 28px;display:flex;align-items:center;gap:14px}
 .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:15px;letter-spacing:-.02em}
 .brand .dot{width:9px;height:9px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
@@ -431,10 +430,11 @@ h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-wei
 .fchip:hover .fx{color:var(--bad)}
 .fclear{background:none;border:none;color:var(--bad);font-family:var(--sans);font-size:12px;font-weight:600;cursor:pointer;padding:3px 6px}
 .fclear:hover{text-decoration:underline}
-.tbl{width:100%;border-collapse:collapse;font-size:13px}
-.tbl thead th{position:sticky;top:58px;background:var(--panel);text-align:left;font-size:10.5px;font-weight:700;
-  text-transform:uppercase;letter-spacing:.08em;color:var(--subtle);padding:10px 12px;border-bottom:1px solid var(--line);
-  white-space:nowrap;cursor:pointer;user-select:none;z-index:10}
+.tbl-scroll{overflow:auto;max-height:min(62vh,640px)}
+.tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.tbl thead th{position:sticky;top:0;z-index:5;background:var(--panel);text-align:left;font-size:10.5px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--subtle);padding:10px 12px;
+  box-shadow:0 1px 0 var(--line);white-space:nowrap;cursor:pointer;user-select:none}
 .tbl thead th:hover{color:var(--text)}
 .tbl thead th.asc::after{content:" ↑"}
 .tbl thead th.desc::after{content:" ↓"}
@@ -547,7 +547,7 @@ footer{color:var(--subtle);font-size:11.5px;text-align:center;margin-top:44px;fo
       <span class="badge" id="sess-count"></span>
     </div>
     <div id="fbar" class="fbar" style="display:none"></div>
-    <div style="overflow:auto">
+    <div class="tbl-scroll">
       <table class="tbl" id="tbl">
         <thead><tr>
           <th data-k="title">Session</th><th>Agent / Model</th><th data-k="time_created">Started</th>
