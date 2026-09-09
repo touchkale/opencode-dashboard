@@ -1585,6 +1585,15 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .model-row.clickable{cursor:pointer;border-radius:8px}
 .model-row.clickable:hover{background:color-mix(in srgb,var(--accent) 4%,transparent)}
 .model-row.active{outline:2px solid var(--accent);outline-offset:-2px}
+/* compact leaderboard rows (file/subsystem/commit panels) */
+.crows .model-row{grid-template-columns:minmax(120px,180px) 1fr auto;gap:10px;padding:6px 0}
+.crows .model-row .mn{font-size:12px}
+.crows .model-row .ms{font-size:10.5px}
+.crows .model-row .mbar{height:9px;border-radius:5px}
+.crows .model-row .mv{font-size:11.5px}
+.more-btn{display:block;width:100%;margin-top:8px;background:none;border:1px solid var(--line);border-radius:9px;
+  padding:7px 10px;font-family:var(--sans);font-size:12px;font-weight:600;color:var(--muted);cursor:pointer}
+.more-btn:hover{color:var(--text);border-color:var(--subtle)}
 .hbar-row{display:flex;align-items:flex-end;gap:3px;height:90px;margin-top:6px}
 .hbar{flex:1;background:linear-gradient(180deg,var(--accent),var(--accent2));border-radius:3px 3px 0 0;min-height:2px;cursor:pointer}
 .hbar:hover{filter:brightness(1.15)}
@@ -1653,7 +1662,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button class="pbtn active" data-fs="file">Files</button>
         <button class="pbtn" data-fs="sub">Subsystems</button>
       </div>
-      <div id="file-chart"></div>
+      <div id="file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
       <div class="ctitle">Tokens per commit <small id="commit-sub">prior 24h sessions · click to filter</small></div>
@@ -1661,7 +1670,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button class="pbtn active" data-cs="toks">By tokens</button>
         <button class="pbtn" data-cs="recent">Recent</button>
       </div>
-      <div id="commit-chart"></div>
+      <div id="commit-chart" class="crows"></div>
     </div>
   </div>
 
@@ -1741,7 +1750,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button class="pbtn active" data-rfs="file">Files</button>
         <button class="pbtn" data-rfs="sub">Subsystems</button>
       </div>
-      <div id="r-file-chart"></div>
+      <div id="r-file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
       <div class="ctitle">Tokens per commit <small id="r-commit-sub">prior 24h requests · time-matched</small></div>
@@ -1749,7 +1758,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button class="pbtn active" data-rcs="toks">By tokens</button>
         <button class="pbtn" data-rcs="recent">Recent</button>
       </div>
-      <div id="r-commit-chart"></div>
+      <div id="r-commit-chart" class="crows"></div>
     </div>
   </div>
 
@@ -1814,6 +1823,7 @@ let sortK='time_created', sortAsc=false;
 let RANGE='all', SPLIT=false, SHARE=false;
 let RRANGE='all', RSPLIT=false, RSHARE=false;
 let FS='file', CS='toks', RFS='file', RCS='toks';
+let FS_EXP=false, CS_EXP=false, RFS_EXP=false, RCS_EXP=false;
 let currentRows=[];
 let currentRRows=[];
 const RFSTATE={day:null,model:null,provider:null,status:''};
@@ -1950,18 +1960,19 @@ function renderFileChart(){
   if(!rows.length){el.innerHTML='<div class="empty">No file touches yet.</div>';return;}
   const t=T(),totalAll=rows.reduce((a,r)=>a+(r[1]||0),0)||1;
   const max=Math.max(...rows.map(r=>r[1]||0),1);
-  el.innerHTML=rows.map(r=>{
+  const shown=FS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
     const name=r[0],toks=r[1]||0,n=r[2]||0,avg=r[3]||0;
     const short=FS==='file'?shortPath(name):name;
     const key=FS==='file'?'file':'sub';
     const active=key==='file'?(FSTATE.file===name):(FSTATE.sub===name);
-    const tip='<b>'+ESC(name)+'</b><span class="trow"><span>Tokens</span><b>'+FN(toks)+' ('+(toks/totalAll*100).toFixed(1)+'% of top)</b></span>'+
-      '<span class="trow"><span>Sessions</span><b>'+n+'</b></span><span class="trow"><span>Avg / session</span><b>'+FN(avg)+'</b></span>';
+    const tip='<b>'+ESC(name)+'</b><span class=\'trow\'><span>Tokens</span><b>'+FN(toks)+' ('+(toks/totalAll*100).toFixed(1)+'% of top)</b></span>'+
+      '<span class=\'trow\'><span>Sessions</span><b>'+n+'</b></span><span class=\'trow\'><span>Avg / session</span><b>'+FN(avg)+'</b></span>';
     return '<div class="model-row clickable'+(active?' active':'')+'" data-f="'+key+'|'+ESC(name)+'" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(short)+'</div><div class="ms">'+n+' sess · avg '+FN(avg)+'</div></div>'+
       '<div class="mbar"><i style="width:'+(toks/max*100).toFixed(1)+'%;background:'+(FS==='file'?t.accent:t.accent2)+'"></i></div>'+
       '<div class="mv">'+FN(toks)+'</div></div>';
-  }).join('');
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="fs">'+(FS_EXP?'Show less':'Show all '+rows.length)+' '+(FS_EXP?'▴':'▾')+'</button>':'');
 }
 function commitRows(){
   const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
@@ -1986,18 +1997,19 @@ function renderCommitChart(){
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
-  el.innerHTML=rows.map(r=>{
+  const shown=CS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
     const sha=r[0],msg=r[1]||'(no message)',date=r[2],proj=r[3],nf=r[4]||0,add=r[5]||0,del=r[6]||0,toks=r[7]||0,ns=r[8]||0;
-    const tip='<b>'+ESC(msg)+'</b><span class="trow"><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
-      '<span class="trow"><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
-      '<span class="trow"><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class="trow"><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
+    const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
+      '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
+      '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
+      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
     return '<div class="model-row clickable'+(FSTATE.commit===sha?' active':'')+'" data-f="commit|'+sha+'" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
       '<div class="mbar"><i style="width:'+Math.max(toks?2:0,toks/max*100).toFixed(1)+'%;background:'+t.accent2+'"></i></div>'+
       '<div class="mv">'+(toks?FN(toks):'—')+'</div></div>';
-  }).join('');
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cs">'+(CS_EXP?'Show less':'Show all '+rows.length)+' '+(CS_EXP?'▴':'▾')+'</button>':'');
 }
 /* period helpers */
 function cutDate(){
@@ -2349,17 +2361,18 @@ function renderRouterFileChart(){
   const t=T();
   const totalAll=rows.reduce((a,r)=>a+(r[1]||0),0)||1;
   const max=Math.max(...rows.map(r=>r[1]||0),1);
-  el.innerHTML=rows.map(r=>{
+  const shown=RFS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
     const name=r[0],toks=r[1]||0,n=r[2]||0,avg=r[3]||0;
     const short=RFS==='file'?shortPath(name):name;
-    const tip='<b>'+ESC(name)+'</b><span class="trow"><span>Tokens</span><b>'+FN(toks)+'</b></span>'+
-      '<span class="trow"><span>Sessions</span><b>'+n+'</b></span><span class="trow"><span>Avg / session</span><b>'+FN(avg)+'</b></span>'+
-      '<span class="trow"><span>Source</span><b>local touches</b></span>';
+    const tip='<b>'+ESC(name)+'</b><span class=\'trow\'><span>Tokens</span><b>'+FN(toks)+'</b></span>'+
+      '<span class=\'trow\'><span>Sessions</span><b>'+n+'</b></span><span class=\'trow\'><span>Avg / session</span><b>'+FN(avg)+'</b></span>'+
+      '<span class=\'trow\'><span>Source</span><b>local touches</b></span>';
     return '<div class="model-row" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(short)+'</div><div class="ms">'+n+' sess · avg '+FN(avg)+'</div></div>'+
       '<div class="mbar"><i style="width:'+(toks/max*100).toFixed(1)+'%;background:'+(RFS==='file'?t.accent:t.accent2)+'"></i></div>'+
       '<div class="mv">'+FN(toks)+'</div></div>';
-  }).join('');
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="rfs">'+(RFS_EXP?'Show less':'Show all '+rows.length)+' '+(RFS_EXP?'▴':'▾')+'</button>':'');
 }
 function rCommitRows(){
   const cut=RRANGE==='all'?0:Date.now()-RRANGE*86400000;
@@ -2384,18 +2397,19 @@ function renderRouterCommitChart(){
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
-  el.innerHTML=rows.map(r=>{
+  const shown=RCS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
     const sha=r[0],msg=r[1]||'(no message)',date=r[2],proj=r[3],nf=r[4]||0,add=r[5]||0,del=r[6]||0,toks=r[7]||0,nq=r[8]||0;
-    const tip='<b>'+ESC(msg)+'</b><span class="trow"><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
-      '<span class="trow"><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
-      '<span class="trow"><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class="trow"><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+nq+' requests</b></span>';
+    const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
+      '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
+      '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
+      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+nq+' requests</b></span>';
     return '<div class="model-row" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
       '<div class="mbar"><i style="width:'+Math.max(toks?2:0,toks/max*100).toFixed(1)+'%;background:'+t.accent2+'"></i></div>'+
       '<div class="mv">'+(toks?FN(toks):'—')+'</div></div>';
-  }).join('');
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="rcs">'+(RCS_EXP?'Show less':'Show all '+rows.length)+' '+(RCS_EXP?'▴':'▾')+'</button>':'');
 }
 function rHumanize(n){n=Number(n)||0;const words=Math.round(n/1.3);if(words>1e6)return (words/1e6).toFixed(1)+'M words';if(words>1e3)return (words/1e3).toFixed(0)+'K words';return words+' words';}
 function renderRouterRecords(R,totTokens){
@@ -2695,24 +2709,33 @@ document.addEventListener('click',e=>{
 $('agent-f').addEventListener('change',e=>{FSTATE.agent=e.target.value||null;renderAll();});
 $('model-f').addEventListener('change',e=>{FSTATE.model=e.target.value||null;renderAll();});
 document.querySelectorAll('.pbtn[data-fs]').forEach(b=>b.onclick=()=>{
-  FS=b.dataset.fs;
+  FS=b.dataset.fs;FS_EXP=false;
   document.querySelectorAll('.pbtn[data-fs]').forEach(x=>x.classList.toggle('active',x===b));
   renderFileChart();
 });
 document.querySelectorAll('.pbtn[data-cs]').forEach(b=>b.onclick=()=>{
-  CS=b.dataset.cs;
+  CS=b.dataset.cs;CS_EXP=false;
   document.querySelectorAll('.pbtn[data-cs]').forEach(x=>x.classList.toggle('active',x===b));
   renderCommitChart();
 });
 document.querySelectorAll('.pbtn[data-rfs]').forEach(b=>b.onclick=()=>{
-  RFS=b.dataset.rfs;
+  RFS=b.dataset.rfs;RFS_EXP=false;
   document.querySelectorAll('.pbtn[data-rfs]').forEach(x=>x.classList.toggle('active',x===b));
   renderRouterFileChart();
 });
 document.querySelectorAll('.pbtn[data-rcs]').forEach(b=>b.onclick=()=>{
-  RCS=b.dataset.rcs;
+  RCS=b.dataset.rcs;RCS_EXP=false;
   document.querySelectorAll('.pbtn[data-rcs]').forEach(x=>x.classList.toggle('active',x===b));
   renderRouterCommitChart();
+});
+document.addEventListener('click',e=>{
+  const b=e.target.closest?e.target.closest('[data-exp]'):null;
+  if(!b)return;
+  const k=b.dataset.exp;
+  if(k==='fs'){FS_EXP=!FS_EXP;renderFileChart();}
+  else if(k==='cs'){CS_EXP=!CS_EXP;renderCommitChart();}
+  else if(k==='rfs'){RFS_EXP=!RFS_EXP;renderRouterFileChart();}
+  else if(k==='rcs'){RCS_EXP=!RCS_EXP;renderRouterCommitChart();}
 });
 document.querySelectorAll('.pbtn[data-r]').forEach(b=>b.onclick=()=>{
   RANGE=b.dataset.r;
