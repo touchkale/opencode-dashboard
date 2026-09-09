@@ -1,0 +1,617 @@
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime, timedelta
+
+import pytest
+
+import opencode_dashboard as d
+
+
+def seed_db(path, n_sessions=40, days_back_max=400):
+    """Create an opencode-schema-shaped SQLite DB with synthetic data."""
+    con = sqlite3.connect(path)
+    c = con.cursor()
+    c.executescript("""
+    CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, agent TEXT, model TEXT,
+      time_created INTEGER, time_updated INTEGER, tokens_input INTEGER, tokens_output INTEGER,
+      tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER,
+      cost REAL, project_id TEXT);
+    CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+    CREATE TABLE session_input(session_id TEXT, prompt TEXT, time_created INTEGER);
+    """)
+    c.execute("INSERT INTO project VALUES ('p1','Demo','/work/demo')")
+    now_ms = int(datetime.now().timestamp() * 1000)
+    model = json.dumps({"id": "anthropic/claude-sonnet-4-6"})
+    for i in range(n_sessions):
+        sid = f"s{i:04d}"
+        start = now_ms - (i % days_back_max + 1) * 86400000
+        c.execute(
+            "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, f"Session {i}", "build", model, start, start + 60000,
+             1000, 500, 100, 200, 100, 0.01, "p1"),
+        )
+        for j in range(3):
+            mid = f"m{i}-{j}"
+            mt = start + j * 10000
+            role = "user" if j % 2 == 0 else "assistant"
+            c.execute("INSERT INTO message VALUES (?,?,?,?)", (mid, sid, mt, json.dumps({"role": role})))
+            if role == "user":
+                c.execute("INSERT INTO session_input VALUES (?,?,?)", (sid, f"prompt {i} {j}", mt))
+            else:
+                c.execute("INSERT INTO part VALUES (?,?,?,?,?)",
+                          (f"p{i}-{j}-t", mid, sid, mt, json.dumps(
+                              {"type": "tool", "tool": "bash", "state": {"status": "completed"}})))
+                c.execute("INSERT INTO part VALUES (?,?,?,?,?)",
+                          (f"p{i}-{j}-s", mid, sid, mt + 1, json.dumps(
+                              {"type": "step-finish",
+                               "tokens": {"input": 100, "output": 50, "reasoning": 10, "total": 400, "cache": {"read": 40}},
+                               "cost": 0.001})))
+    con.commit()
+    con.close()
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    path = str(tmp_path / "opencode.db")
+    seed_db(path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def reset_caches():
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+        d.ROUTER_CACHE.clear()
+    yield
+
+
+def seed_router_events(path):
+    """Write a small usage-events.jsonl with ok / 429 / 500 rows."""
+    rows = [
+        {"at": "2026-09-04T10:00:00.000Z", "model": "opencode-free-responses/muse-spark-1.3-contributor-free",
+         "provider": "opencode-free", "status": 200, "durationMs": 2000,
+         "inputTokens": 1000, "cachedInputTokens": 200, "outputTokens": 100, "totalTokens": 1100},
+        {"at": "2026-09-04T11:00:00.000Z", "model": "opencode-free-responses/muse-spark-1.3-contributor-free",
+         "provider": "opencode-free", "status": 200, "durationMs": 3000,
+         "inputTokens": 2000, "cachedInputTokens": 500, "outputTokens": 300, "totalTokens": 2300},
+        {"at": "2026-09-04T12:00:00.000Z", "model": "gpt-5.6-sol",
+         "provider": "openai", "status": 200, "durationMs": 1000,
+         "inputTokens": 500, "cachedInputTokens": 0, "outputTokens": 50, "totalTokens": 550},
+        {"at": "2026-09-05T09:00:00.000Z", "model": "opencode-go/deepseek-v4-flash",
+         "provider": "opencode-go", "status": 429, "durationMs": 48},
+        {"at": "2026-09-05T09:01:00.000Z", "model": "opencode-zen/muse-spark-1.3-contributor-free",
+         "provider": "opencode-go", "status": 500, "durationMs": 6000},
+        "not json at all",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(r if isinstance(r, str) else json.dumps(r))
+            f.write("\n")
+    return path
+
+
+def test_json_html_escapes_script_breakout():
+    payload = d.json_html({"title": "</script><script>alert(1)</script>"})
+    assert "</script>" not in payload
+    assert "\\u003c/script" in payload
+    # round-trips through json.loads to the original string
+    assert json.loads(payload)["title"] == "</script><script>alert(1)</script>"
+
+
+def test_json_html_escapes_unicode_separators():
+    payload = d.json_html({"s": "a\u2028b\u2029c"})
+    assert json.loads(payload)["s"] == "a\u2028b\u2029c"
+    assert "\u2028" not in payload
+
+
+def test_query_stats_shape_and_aggregates(db_path):
+    con = d.connect(db_path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    assert set(("source", "source_label", "totals", "sessions", "tools", "agents",
+                "models", "projects", "files", "subsystems", "file_subsys",
+                "commits", "session_files", "commit_sessions",
+                "days", "hours", "activity", "insights",
+                "records", "range", "generated_at")) <= set(stats)
+    assert stats["source"] == "local"
+    assert stats["totals"]["sessions"] == 40
+    assert stats["totals"]["messages"] == 120
+    assert stats["totals"]["cost"] == pytest.approx(0.4, abs=0.01)
+    # token-first totals (cache = read + write, matching part 'total' fields)
+    assert stats["totals"]["tokens_total"] == (
+        stats["totals"]["tokens_input"] + stats["totals"]["tokens_output"]
+        + stats["totals"]["tokens_reasoning"] + stats["totals"]["tokens_cache_read"]
+        + stats["totals"]["tokens_cache_write"]
+    )
+    assert 0 <= stats["totals"]["cache_rate"] <= 100
+    assert len(stats["sessions"]) == 40
+    assert len(stats["activity"]) == d.ACTIVITY_DAYS
+    assert stats["activity"][-1]["date"] == datetime.now().date().isoformat()
+    assert len(stats["hours"]) == 24
+    assert "hour_tokens" not in stats
+    # files/subsystems/commits present (seed has no edit/write parts, no git)
+    assert stats["files"] == []
+    assert stats["subsystems"] == []
+    assert stats["commits"] == []
+    assert "heatmap" not in stats
+    assert all("prompts" not in s for s in stats["sessions"])
+    assert all("tools_bd" not in s for s in stats["sessions"])
+    assert all("tokens_total" in s and "burn" in s and "tokens_cache" in s for s in stats["sessions"])
+    assert stats["days"] == sorted(stats["days"], key=lambda x: x["date"])
+    assert all("total" in x for x in stats["days"])
+    # models: [name, n, total, ti, to, tr, cache, cost, avg, cache_rate]
+    assert stats["models"] and len(stats["models"][0]) == 10
+    assert stats["models"] == sorted(stats["models"], key=lambda m: -m[2])
+    # projects: [name, n, toks]
+    assert all(len(p) == 3 for p in stats["projects"])
+    # records
+    assert stats["records"]["streaks"]["longest"] >= 1
+    assert stats["records"]["biggest_day"] is not None
+
+
+def test_query_stats_caps_sessions(tmp_path):
+    path = str(tmp_path / "big.db")
+    seed_db(path, n_sessions=800)
+    con = d.connect(path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    assert len(stats["sessions"]) == d.MAX_SESSION_ROWS
+    assert stats["totals"]["sessions"] == 800
+
+
+def test_activity_window_is_zero_filled(db_path):
+    con = d.connect(db_path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    recorded = {x["date"] for x in stats["days"]}
+    assert len(stats["activity"]) == 364
+    # every recorded day is present in the padded window
+    for slot in stats["activity"]:
+        if slot["date"] in recorded:
+            assert slot["msgs"] > 0
+    empty = [s for s in stats["activity"] if s["date"] not in recorded]
+    assert empty
+    assert all(s["msgs"] == 0 and s["cost"] == 0 and "tools" not in s for s in empty)
+
+
+def test_session_prompts_primary(db_path):
+    con = d.connect(db_path)
+    try:
+        prompts = d.session_prompts(con, "s0000")
+    finally:
+        con.close()
+    assert prompts and prompts[0]["p"] == "prompt 0 0"
+
+
+def test_session_prompts_fallback(tmp_path):
+    path = str(tmp_path / "opencode.db")
+    seed_db(path)
+    con = sqlite3.connect(path)
+    con.execute("DELETE FROM session_input")
+    # add a user text part (older opencode schema) so the fallback can recover it
+    con.execute(
+        "INSERT INTO part VALUES ('fb-t1','m0-0','s0000',? ,?)",
+        (int(datetime.now().timestamp() * 1000), json.dumps({"type": "text", "text": "fallback prompt"})),
+    )
+    con.commit()
+    con.close()
+    con = d.connect(path)
+    try:
+        prompts = d.session_prompts(con, "s0000")
+    finally:
+        con.close()
+    assert any("fallback prompt" in p["p"] for p in prompts)
+
+
+def test_blank_stats_full_shape():
+    stats = d.blank_stats("local", "Local OpenCode data", error="boom", insight="sad")
+    assert stats["error"] == "boom"
+    assert stats["insights"] == ["sad"]
+    assert stats["totals"]["sessions"] == 0
+    assert len(stats["activity"]) == 364
+    assert len(stats["hours"]) == 24
+    assert stats["files"] == []
+    assert stats["subsystems"] == []
+    assert stats["commits"] == []
+    assert stats["records"]["biggest_day"] is None
+
+
+def test_day_total_and_cache_rate():
+    assert d.day_total({"ti": 100, "to": 50, "tr": 10, "cache": 40}) == 200
+    assert d.cache_rate(100, 100) == 50.0
+    assert d.cache_rate(0, 0) == 0.0
+    # Codex Router reports cached input as a subset of total input.
+    assert d.router_cache_rate(100, 40) == 40.0
+    assert d.router_cache_rate(100, 120) == 100.0
+    assert d.router_cache_rate(0, 0) == 0.0
+
+
+def test_compute_streaks():
+    act = d.zero_days_window()
+    # last 3 days active
+    for slot in act[-3:]:
+        slot["msgs"] = 1
+    streaks = d.compute_streaks(act)
+    assert streaks["current"] == 3
+    assert streaks["longest"] >= 3
+
+
+def test_models_sorted_by_total_and_cache(db_path):
+    con = d.connect(db_path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    totals = [m[2] for m in stats["models"]]
+    assert totals == sorted(totals, reverse=True)
+    # cache per model present
+    assert all(m[6] >= 0 for m in stats["models"])
+
+
+def test_cached_local_stats_invalidation(db_path):
+    first = d.cached_local_stats(db_path)
+    assert d.cached_local_stats(db_path) is first  # cached
+    os.utime(db_path, (time.time(), time.time()))
+    second = d.cached_local_stats(db_path)
+    assert second is not first
+
+
+def test_zero_days_window():
+    window = d.zero_days_window()
+    assert len(window) == 364
+    first = datetime.fromisoformat(window[0]["date"]).date()
+    last = datetime.fromisoformat(window[-1]["date"]).date()
+    assert last - first == timedelta(days=363)
+    assert last == datetime.now().date()
+
+
+def test_router_short_and_free():
+    assert d.router_short("opencode-free-responses/muse-spark-1.3-contributor-free") == "muse-spark-1.3-contributor-free"
+    assert d.router_short("") == "—"
+    assert d.router_is_free("x/muse-spark-1.3-contributor-free") is True
+    assert d.router_is_free("gpt-5.6-sol") is False
+
+
+def test_what_if_cost():
+    assert d.what_if_cost("muse-spark-1.3-contributor-free", 1_000_000, 1_000_000) == pytest.approx(0.30)
+    assert d.what_if_cost("gpt-5.6-sol", 1_000_000, 1_000_000) == 0.0
+
+
+def test_parse_router_events_mixed(tmp_path):
+    path = seed_router_events(str(tmp_path / "usage-events.jsonl"))
+    events = d.parse_router_events(path)
+    assert len(events) == 5  # bad line skipped
+    ok = [e for e in events if e["ok"]]
+    assert len(ok) == 3
+    err429 = [e for e in events if e["status"] == 429]
+    assert len(err429) == 1
+    # error rows carry zero tokens (actuals only, never estimated)
+    assert err429[0]["total"] == 0
+    spark = [e for e in events if e["short"] == "muse-spark-1.3-contributor-free" and e["ok"]]
+    assert len(spark) == 2
+    assert spark[0]["free"] is True
+    assert spark[0]["what_if"] > 0
+
+
+def test_query_router_stats_aggregates(tmp_path):
+    path = seed_router_events(str(tmp_path / "usage-events.jsonl"))
+    stats = d.query_router_stats(path)
+    assert stats["source"] == "router"
+    assert stats["source_label"] == "Codex data"
+    assert stats["totals"]["requests"] == 5
+    assert stats["totals"]["ok"] == 3
+    assert stats["totals"]["errors"] == 2
+    assert stats["totals"]["err429"] == 1
+    assert stats["totals"]["err500"] == 1
+    assert stats["totals"]["tokens_total"] == (
+        stats["totals"]["tokens_input"] + stats["totals"]["tokens_output"]
+        + stats["totals"]["tokens_reasoning"]
+    )
+    assert stats["totals"]["cache_rate"] == pytest.approx(
+        stats["totals"]["tokens_cache_read"] / stats["totals"]["tokens_input"] * 100,
+        abs=0.1,
+    )
+    assert len(stats["models"]) == 4
+    assert stats["models"] == sorted(stats["models"], key=lambda m: -m[2])
+    # model rows: [name, reqs, total, ti, to, cache, ok, err, avg, hit, provider, free, what_if]
+    assert all(len(m) == 13 for m in stats["models"])
+    assert len(stats["days"]) == 2
+    assert all(day["total"] == pytest.approx(day["ti"] + day["to"] + day["tr"])
+               for day in stats["days"])
+    assert len(stats["hours"]) == 24
+    assert len(stats["requests"]) == 5
+    assert stats["range"].startswith("2026-09-04")
+    assert stats["totals"]["what_if_cost"] > 0
+    # mirrored OpenCode records
+    rec = stats["records"]
+    assert rec["biggest_day"]["date"] == "2026-09-04"
+    assert rec["biggest_model"]["name"] == "opencode-free-responses/muse-spark-1.3-contributor-free"
+    assert rec["biggest_model"]["requests"] == 2
+    assert rec["biggest_request"]["total"] == 2300
+    # 11:00Z event carries the most tokens; compare in local time (TZ-robust)
+    assert rec["peak_hour"] == d._router_event_day_hour("2026-09-04T11:00:00.000Z")[1]
+    assert rec["streaks"]["longest"] >= 1
+
+
+def test_blank_router_stats_shape():
+    stats = d.blank_router_stats(error="boom")
+    assert stats["error"] == "boom"
+    assert stats["totals"]["requests"] == 0
+    assert len(stats["hours"]) == 24
+    assert len(stats["activity"]) == d.ACTIVITY_DAYS
+    assert stats["records"]["biggest_day"] is None
+    assert stats["records"]["biggest_model"] is None
+    assert stats["records"]["biggest_request"] is None
+
+
+def test_cached_router_stats_invalidation(tmp_path):
+    path = seed_router_events(str(tmp_path / "usage-events.jsonl"))
+    first = d.cached_router_stats(path)
+    assert d.cached_router_stats(path) is first  # cached
+    os.utime(path, (time.time(), time.time()))
+    second = d.cached_router_stats(path)
+    assert second is not first
+
+
+def test_router_missing_file():
+    with pytest.raises(RuntimeError):
+        d.cached_router_stats("/nonexistent/usage-events.jsonl")
+    stats = d.blank_router_stats(error="x")
+    assert stats["source"] == "router"
+
+
+def test_agents_projects_include_cache(db_path):
+    con = d.connect(db_path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    # seed: each session has ti=1000, to=500, tr=100, cache_read=200, cache_write=100
+    build = [a for a in stats["agents"] if a[0] == "build"][0]
+    assert build[1] == 40
+    assert build[2] == 40 * (1000 + 500 + 100 + 200 + 100)
+    proj = [p for p in stats["projects"] if p[0] == "Demo"][0]
+    assert proj[2] == 40 * (1000 + 500 + 100 + 200 + 100)
+
+
+def test_records_from_full_table_beyond_cap(tmp_path):
+    path = str(tmp_path / "big.db")
+    seed_db(path, n_sessions=600)
+    con = sqlite3.connect(path)
+    # an old session (outside the 500 most-recent) with huge tokens
+    old = int((datetime.now() - timedelta(days=300)).timestamp() * 1000)
+    con.execute(
+        "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sold", "Ancient giant", "build", json.dumps({"id": "m"}),
+         old, old + 10 * 60000, 10_000_000, 0, 0, 0, 0, 0.0, "p1"),
+    )
+    con.commit()
+    con.close()
+    con = d.connect(path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    assert len(stats["sessions"]) == d.MAX_SESSION_ROWS
+    assert stats["records"]["biggest_session"]["title"] == "Ancient giant"
+    assert stats["records"]["biggest_session"]["total"] == 10_000_000
+    assert stats["records"]["fastest_burn"] is not None
+
+
+def test_streak_skips_quiet_today():
+    act = d.zero_days_window()
+    # active 5 days ending yesterday, today quiet
+    for slot in act[-6:-1]:
+        slot["msgs"] = 1
+    streaks = d.compute_streaks(act)
+    assert streaks["current"] == 5
+    assert streaks["longest"] >= 5
+    # all quiet -> 0, not crash
+    assert d.compute_streaks(d.zero_days_window()) == {"current": 0, "longest": 0}
+
+
+def test_router_streak_ignores_error_only_days():
+    act = d.zero_days_window()
+    yesterday = act[-2]
+    yesterday["msgs"] = 3  # requests...
+    yesterday["sessions"] = 0  # ...but none ok, no tokens
+    yesterday["ti"] = 0
+    yesterday["to"] = 0
+    act[-3]["msgs"] = 2
+    act[-3]["sessions"] = 2
+    act[-3]["ti"] = 100
+    act[-3]["to"] = 10
+    assert d.compute_streaks(act, tokens_only=True)["current"] == 0
+    yesterday["ti"] = 50
+    assert d.compute_streaks(act, tokens_only=True)["current"] == 2
+
+
+def test_router_unmetered_and_ok_only_latency(tmp_path):
+    rows = [
+        {"at": "2026-09-04T10:00:00.000Z", "model": "local", "provider": "local",
+         "status": 200, "durationMs": 20},
+        {"at": "2026-09-04T11:00:00.000Z", "model": "gpt-5.6-sol", "provider": "openai",
+         "status": 200, "durationMs": 4000,
+         "inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100, "totalTokens": 1100},
+        {"at": "2026-09-04T12:00:00.000Z", "model": "gpt-5.6-sol", "provider": "openai",
+         "status": 429, "durationMs": 5},
+    ]
+    path = str(tmp_path / "usage-events.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    stats = d.query_router_stats(path)
+    assert stats["totals"]["unmetered"] == 1
+    assert stats["totals"]["requests"] == 2  # unmetered excluded from all counts
+    assert stats["totals"]["ok"] == 1
+    assert stats["totals"]["messages"] == 2
+    assert stats["totals"]["tokens_total"] == 1100
+    # 20ms unmetered row and 5ms 429 reject excluded from the latency average
+    assert stats["totals"]["avg_ms"] == pytest.approx(4000)
+    assert len(stats["models"]) == 1  # unmetered 'local' model excluded
+    assert any("excluded from all counts" in i for i in stats["insights"])
+
+
+def test_router_truncation_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "MAX_ROUTER_EVENTS", 3)
+    path = str(tmp_path / "usage-events.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(5):
+            f.write(json.dumps(
+                {"at": f"2026-09-04T1{i}:00:00.000Z", "model": "m", "provider": "p",
+                 "status": 200, "durationMs": 10,
+                 "inputTokens": 10, "outputTokens": 1, "totalTokens": 11}) + "\n")
+    stats = d.query_router_stats(path)
+    assert stats["truncated"] is True
+    assert stats["scanned"] == 3
+    assert stats["total_lines"] == 5
+    assert any("most recent" in i for i in stats["insights"])
+
+
+def test_router_day_err_breakdown(tmp_path):
+    path = seed_router_events(str(tmp_path / "usage-events.jsonl"))
+    stats = d.query_router_stats(path)
+    by_date = {x["date"]: x for x in stats["days"]}
+    assert by_date["2026-09-05"]["err429"] == 1
+    assert by_date["2026-09-05"]["err500"] == 1
+    # padded activity keeps the breakdown for heatmap/rollup consistency
+    act = [s for s in stats["activity"] if s["date"] == "2026-09-05"][0]
+    assert act["reqs"] == 2 and act["ok"] == 0 and act["err"] == 2
+    assert act["err429"] == 1 and act["err500"] == 1
+
+
+def test_router_recent_sorted_by_time(tmp_path):
+    path = str(tmp_path / "usage-events.jsonl")
+    rows = [
+        {"at": "2026-09-04T12:00:00.000Z", "model": "m", "provider": "p", "status": 200,
+         "durationMs": 1, "inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+        {"at": "2026-09-05T09:00:00+00:00", "model": "m", "provider": "p", "status": 200,
+         "durationMs": 1, "inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+        {"at": "2026-09-04T15:30:00.000Z", "model": "m", "provider": "p", "status": 200,
+         "durationMs": 1, "inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    stats = d.query_router_stats(path)
+    assert [r["at"] for r in stats["requests"]] == [
+        "2026-09-05T09:00:00+00:00",
+        "2026-09-04T15:30:00.000Z",
+        "2026-09-04T12:00:00.000Z",
+    ]
+
+
+def test_fingerprint_covers_wal(tmp_path):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db)
+    first = d._fingerprint_paths([db])
+    # simulate WAL growth without touching the main file
+    with open(db + "-wal", "wb") as f:
+        f.write(b"\0" * 100)
+    second = d._fingerprint_paths([db])
+    assert first != second
+
+
+def test_subsystem_for_file():
+    wt = ["/work/demo", "/other/repo"]
+    assert d.subsystem_for_file("/work/demo/app/main.py", wt) == "app"
+    assert d.subsystem_for_file("/work/demo/README.md", wt) == "README.md"
+    assert d.subsystem_for_file("/other/repo/x/y.py", wt) == "x"
+    # outside every worktree -> parent folder name, never dropped
+    assert d.subsystem_for_file("/tmp/reelwork/build_cuts.py", wt) == "reelwork"
+    assert d.subsystem_for_file("lonely.py", wt) == "(root)"
+
+
+def test_files_equal_split_and_session_filter(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "collect_repo_commits", lambda *a, **k: [])
+    path = str(tmp_path / "opencode.db")
+    seed_db(path, n_sessions=4)
+    con = sqlite3.connect(path)
+    # s0000 touches two files; s0001 touches one. Each seed session = 1900 toks.
+    con.execute(
+        "INSERT INTO part VALUES ('f1','m0-1','s0000',?,?)",
+        (int(datetime.now().timestamp() * 1000),
+         json.dumps({"type": "tool", "tool": "edit",
+                     "state": {"input": {"filePath": "/work/demo/app/a.py"}}})),
+    )
+    con.execute(
+        "INSERT INTO part VALUES ('f2','m0-1','s0000',?,?)",
+        (int(datetime.now().timestamp() * 1000),
+         json.dumps({"type": "tool", "tool": "write",
+                     "state": {"input": {"filePath": "/work/demo/app/b.py"}}})),
+    )
+    con.execute(
+        "INSERT INTO part VALUES ('f3','m1-1','s0001',?,?)",
+        (int(datetime.now().timestamp() * 1000),
+         json.dumps({"type": "tool", "tool": "edit",
+                     "state": {"input": {"filePath": "/work/demo/app/a.py"}}})),
+    )
+    con.commit()
+    con.close()
+    con = d.connect(path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    by_file = {r[0]: r for r in stats["files"]}
+    # s0000 (1900 toks) split 950/950; s0001 (1900) all on a.py
+    assert by_file["/work/demo/app/a.py"][1] == pytest.approx(950 + 1900)
+    assert by_file["/work/demo/app/b.py"][1] == pytest.approx(950)
+    assert by_file["/work/demo/app/a.py"][2] == 2
+    assert stats["subsystems"][0][0] == "app"
+    assert stats["subsystems"][0][3] == 2  # two files
+    assert stats["session_files"]["s0000"] == ["/work/demo/app/a.py", "/work/demo/app/b.py"]
+    assert stats["file_subsys"]["/work/demo/app/a.py"] == "app"
+
+
+def test_commits_window_attribution(tmp_path, monkeypatch):
+    now_ms = int(datetime.now().timestamp() * 1000)
+    fake = [
+        {"sha": "a" * 40, "subject": "fresh commit", "time": now_ms,
+         "date": "2026-09-09", "project": "Demo", "files": 2, "add": 10, "del": 3},
+        {"sha": "b" * 40, "subject": "ancient commit", "time": now_ms - 30 * 86400000,
+         "date": "2026-08-10", "project": "Demo", "files": 1, "add": 1, "del": 1},
+    ]
+    monkeypatch.setattr(d, "collect_repo_commits", lambda *a, **k: fake)
+    path = str(tmp_path / "opencode.db")
+    seed_db(path, n_sessions=4, days_back_max=1)  # all sessions ~1 day old, in window
+    con = d.connect(path)
+    try:
+        stats = d.query_stats(con)
+    finally:
+        con.close()
+    by_sha = {r[0]: r for r in stats["commits"]}
+    assert by_sha["a" * 40][7] == pytest.approx(4 * 1900)
+    assert by_sha["a" * 40][8] == 4
+    assert by_sha["b" * 40][7] == 0  # outside the 24h window
+    assert ("a" * 40) in stats["commit_sessions"]
+    assert ("b" * 40) not in stats["commit_sessions"]
+
+
+def test_router_commits_time_matched(tmp_path, monkeypatch):
+    events = str(tmp_path / "usage-events.jsonl")
+    seed_router_events(events)
+    monkeypatch.setattr(
+        d, "collect_repo_commits", lambda *a, **k: [
+            {"sha": "c" * 40, "subject": "codex commit", "time": int(datetime(2026, 9, 5).timestamp() * 1000),
+             "date": "2026-09-05", "project": "Demo", "files": 1, "add": 5, "del": 0},
+        ],
+    )
+    stats = d.query_router_stats(events, worktrees=[("Demo", "/work/demo")])
+    assert len(stats["commits"]) == 1
+    row = stats["commits"][0]
+    assert row[0] == "c" * 40
+    # 2026-09-04 events (1100+2300+550) fall in the 24h window before 2026-09-05
+    assert row[7] == pytest.approx(1100 + 2300 + 550)
+    assert row[8] == 3
+    assert "hour_tokens" not in stats
