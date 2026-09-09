@@ -794,7 +794,7 @@ def _fingerprint_paths(paths):
 def cached_local_stats(db_path):
     path = Path(db_path)
     try:
-        st = path.stat()
+        path.stat()
     except OSError:
         raise RuntimeError(
             f"Database not found: {db_path}\nRun OpenCode at least once to create it."
