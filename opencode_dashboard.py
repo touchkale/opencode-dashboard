@@ -16,13 +16,17 @@ from urllib.request import pathname2url
 DB_PATH = Path(os.environ.get("HOME", "")) / ".local/share/opencode/opencode.db"
 ROUTER_EVENTS_DEFAULT = Path(os.environ.get("HOME", "")) / ".codex/codex-router/usage-events.jsonl"
 ROUTER_LIMITS_DEFAULT = Path(os.environ.get("HOME", "")) / ".codex/codex-router/rate-limits.json"
+CLINE_DIR_DEFAULT = Path(os.environ.get("HOME", "")) / ".cline/data"
 
 # All cross-thread shared state is guarded by LOCK.
 LOCK = threading.Lock()
 LOCAL_CACHE = {"key": None, "stats": None}
 ROUTER_CACHE = {"key": None, "stats": None}
+CLINE_CACHE = {"key": None, "stats": None}
 MAX_ROUTER_EVENTS = 30000  # most-recent lines scanned from usage-events.jsonl
 MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
+MAX_CLINE_MESSAGES = 30000  # most-recent assistant messages scanned from Cline sessions
+MAX_CLINE_ROWS = 400  # recent Cline messages kept in the /api/cline payload
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
 # Actual free cost is always $0; this estimates what the same tokens would cost.
@@ -1247,6 +1251,434 @@ def cached_router_stats(events_path, limits_path=None, worktrees=None):
     return stats
 
 
+def _cline_day_hour(ts_ms):
+    """Epoch-ms -> (local date, local hour); (None, None) when unusable."""
+    try:
+        if not ts_ms:
+            return None, None
+        dt = datetime.fromtimestamp(float(ts_ms) / 1000)
+        return dt.date().isoformat(), dt.hour
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None, None
+
+
+def _cline_time_key(ts_ms):
+    try:
+        if not ts_ms:
+            return 0.0
+        return float(ts_ms) / 1000
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cline_is_free(model):
+    m = str(model or "")
+    return m.endswith("-free") or m.startswith("cline-free/")
+
+
+def parse_cline_messages(cline_dir, limit=MAX_CLINE_MESSAGES):
+    """Scan Cline Desktop sessions into normalized per-message event dicts.
+
+    Source: <cline_dir>/sessions/*/<id>.messages.json (assistant messages with
+    `metrics: {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`)
+    joined with <cline_dir>/db/sessions.db for provider/model/cwd fallback.
+    Each event: {at, ts, date, hour, model, short, provider, ti, cache, to,
+    total, session_id, cwd}. Missing-metric assistant rows are unmetered and
+    skipped by callers (never estimated).
+    """
+    base = Path(cline_dir)
+    meta = {}
+    db_path = base / "db" / "sessions.db"
+    try:
+        con = connect(db_path)
+        try:
+            for r in con.execute(
+                "SELECT session_id, provider, model, cwd, workspace_root,"
+                " started_at, prompt FROM sessions"
+            ):
+                meta[r["session_id"]] = {
+                    "provider": r["provider"] or "cline",
+                    "model": r["model"] or "—",
+                    "cwd": r["workspace_root"] or r["cwd"] or "",
+                    "started_at": r["started_at"],
+                    "prompt": r["prompt"] or "",
+                }
+        finally:
+            con.close()
+    except Exception:
+        meta = {}
+    sess_dir = base / "sessions"
+    try:
+        session_dirs = sorted(
+            [p for p in sess_dir.iterdir() if p.is_dir()],
+            key=lambda p: p.stat().st_mtime_ns,
+        )
+    except OSError:
+        raise RuntimeError(f"Cline sessions dir not found: {sess_dir}")
+    events = []
+    unmetered = 0
+    for sdir in session_dirs:
+        sid = sdir.name
+        info = meta.get(sid, {})
+        msg_files = sorted(sdir.glob("*.messages.json"))
+        if not msg_files:
+            continue
+        try:
+            with open(msg_files[0], "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        msgs = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(msgs, list):
+            continue
+        for m in msgs:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            metrics = m.get("metrics") or {}
+            ti = num(metrics.get("inputTokens"))
+            to = num(metrics.get("outputTokens"))
+            cr = num(metrics.get("cacheReadTokens"))
+            cw = num(metrics.get("cacheWriteTokens"))
+            total = ti + to + cr + cw
+            model_info = m.get("modelInfo") or {}
+            model = model_info.get("id") or info.get("model") or "—"
+            provider = model_info.get("provider") or info.get("provider") or "cline"
+            ts = m.get("ts")
+            if not ts and info.get("started_at"):
+                try:
+                    s = str(info["started_at"]).strip()
+                    if s.endswith("Z"):
+                        s = s[:-1] + "+00:00"
+                    ts = datetime.fromisoformat(s).timestamp() * 1000
+                except (ValueError, TypeError, OverflowError):
+                    ts = 0
+            date, hour = _cline_day_hour(ts)
+            at = None
+            try:
+                if ts:
+                    at = datetime.fromtimestamp(float(ts) / 1000).astimezone().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                at = None
+            if not total:
+                unmetered += 1
+                continue
+            events.append(
+                {
+                    "at": at,
+                    "ts": ts or 0,
+                    "date": date,
+                    "hour": hour,
+                    "model": str(model),
+                    "short": router_short(model),
+                    "provider": str(provider or "cline"),
+                    "status": 200,
+                    "ok": True,
+                    "ti": ti,
+                    "cache": cr + cw,
+                    "to": to,
+                    "total": total,
+                    "ms": 0.0,
+                    "free": _cline_is_free(model),
+                    "session_id": sid,
+                    "cwd": info.get("cwd") or "",
+                    "prompt": (info.get("prompt") or "")[:120],
+                }
+            )
+    events.sort(key=lambda e: (_cline_time_key(e.get("ts")), str(e.get("at") or "")))
+    if limit and len(events) > limit:
+        events = events[-limit:]
+        truncated_scan = True
+    else:
+        truncated_scan = False
+    return events, unmetered, truncated_scan
+
+
+def query_cline_stats(cline_dir, worktrees=None):
+    """Aggregate Cline Desktop usage into a Codex-shaped dashboard payload.
+
+    Cache semantics are OpenCode-style (cache read+write is a separate stream,
+    NOT a subset of input), so day totals are ti+to+cache everywhere here.
+    """
+    base = Path(cline_dir)
+    if not (base / "sessions").is_dir():
+        raise RuntimeError(f"Cline sessions dir not found: {base / 'sessions'}")
+    events, unmetered, truncated_scan = parse_cline_messages(cline_dir)
+    ti = sum(e["ti"] for e in events)
+    cache = sum(e["cache"] for e in events)
+    to = sum(e["to"] for e in events)
+
+    by_model = {}
+    for e in events:
+        m = by_model.setdefault(
+            e["model"],
+            {"provider": e["provider"], "reqs": 0, "ok": 0, "err": 0,
+             "ti": 0.0, "to": 0.0, "cache": 0.0, "total": 0.0},
+        )
+        m["reqs"] += 1
+        m["ok"] += 1
+        m["ti"] += e["ti"]
+        m["to"] += e["to"]
+        m["cache"] += e["cache"]
+        m["total"] += e["total"]
+    model_rows = []
+    for name, m in by_model.items():
+        tot = m["total"]
+        model_rows.append(
+            [name, m["reqs"], tot, m["ti"], m["to"], m["cache"], m["ok"], m["err"],
+             round(tot / m["ok"], 0) if m["ok"] else 0,
+             cache_rate(m["ti"], m["cache"]), m["provider"], _cline_is_free(name), 0.0]
+        )
+    model_rows.sort(key=lambda r: -r[2])
+
+    by_provider = defaultdict(lambda: {"reqs": 0, "toks": 0.0})
+    for e in events:
+        by_provider[e["provider"]]["reqs"] += 1
+        by_provider[e["provider"]]["toks"] += e["total"]
+
+    by_session = {}
+    for e in events:
+        s = by_session.setdefault(
+            e["session_id"],
+            {"model": e["model"], "provider": e["provider"], "cwd": e["cwd"],
+             "prompt": e["prompt"], "ts": 0, "at": None, "msgs": 0,
+             "ti": 0.0, "to": 0.0, "cache": 0.0, "total": 0.0},
+        )
+        s["msgs"] += 1
+        s["ti"] += e["ti"]
+        s["to"] += e["to"]
+        s["cache"] += e["cache"]
+        s["total"] += e["total"]
+        if _cline_time_key(e.get("ts")) >= _cline_time_key(s["ts"]):
+            s["ts"] = e.get("ts") or s["ts"]
+            s["at"] = e.get("at") or s["at"]
+            s["model"] = e["model"]
+            s["provider"] = e["provider"]
+    sessions = [
+        {"id": sid, "title": (v["prompt"] or sid)[:80] or sid,
+         "agent": "cline", "model": v["model"], "provider": v["provider"],
+         "time_created": v["ts"] or 0, "at": v["at"],
+         "worktree": short_dir(v["cwd"]), "msgs": v["msgs"],
+         "tokens_input": v["ti"], "tokens_output": v["to"],
+         "tokens_reasoning": 0, "tokens_cache": v["cache"],
+         "tokens_total": v["total"]}
+        for sid, v in by_session.items()
+    ]
+    sessions.sort(key=lambda s: s["time_created"], reverse=True)
+
+    day_buckets = {}
+    hour_reqs = defaultdict(int)
+    hour_tokens = defaultdict(float)
+    for e in events:
+        if e["hour"] is not None:
+            hour_reqs[e["hour"]] += 1
+            hour_tokens[e["hour"]] += e["total"]
+        if not e["date"]:
+            continue
+        b = day_buckets.setdefault(
+            e["date"], {"reqs": 0, "ok": 0, "err": 0, "ti": 0.0, "to": 0.0, "cache": 0.0}
+        )
+        b["reqs"] += 1
+        b["ok"] += 1
+        b["ti"] += e["ti"]
+        b["to"] += e["to"]
+        b["cache"] += e["cache"]
+    day_entries = []
+    for d in sorted(day_buckets):
+        b = day_buckets[d]
+        day_entries.append(
+            {"date": d, "msgs": b["reqs"], "sessions": b["ok"], "reqs": b["reqs"],
+             "ok": b["ok"], "err": 0, "ti": round(b["ti"], 1),
+             "to": round(b["to"], 1), "tr": 0, "cache": round(b["cache"], 1),
+             "cost": 0, "total": round(b["ti"] + b["to"] + b["cache"], 1)}
+        )
+    activity = pad_activity(day_entries)
+    for slot in activity:
+        slot["total"] = round(slot["ti"] + slot["to"] + slot["tr"] + slot["cache"], 1)
+        slot.setdefault("reqs", slot.get("msgs", 0))
+
+    recent = sorted(events, key=lambda e: (_cline_time_key(e.get("ts")), str(e.get("at") or "")),
+                    reverse=True)[:MAX_CLINE_ROWS]
+
+    ok_times = sorted(
+        (_cline_time_key(e.get("ts")) * 1000, e["total"])
+        for e in events if _cline_time_key(e.get("ts")) > 0
+    )
+    window_ms = COMMIT_WINDOW_HOURS * 3600 * 1000
+    c_commit_rows = []
+    for c in collect_repo_commits(worktrees or []):
+        lo = c["time"] - window_ms
+        toks = reqs = 0
+        for t_ms, tot in ok_times:
+            if t_ms > c["time"]:
+                break
+            if t_ms >= lo:
+                toks += tot
+                reqs += 1
+        c_commit_rows.append(
+            [c["sha"], c["subject"][:72], c["date"], c["project"],
+             c["files"], c["add"], c["del"], round(toks, 1), reqs]
+        )
+    c_commit_rows.sort(key=lambda r: -r[7])
+    c_commit_rows = c_commit_rows[:MAX_COMMIT_ROWS]
+
+    totals = {
+        "requests": len(events),
+        "ok": len(events),
+        "errors": 0,
+        "err429": 0,
+        "err500": 0,
+        "unmetered": unmetered,
+        "tokens_input": ti,
+        "tokens_output": to,
+        "tokens_reasoning": 0,
+        "tokens_cache_read": cache,
+        "tokens_cache_write": 0,
+        "tokens_total": ti + to + cache,
+        "cache_rate": cache_rate(ti, cache),
+        "models": len(by_model),
+        "providers": len(by_provider),
+        "what_if_cost": 0,
+        "avg_ms": 0,
+        "sessions": len(by_session),
+        "messages": len(events),
+        "cost": 0,
+        "avg_duration_min": 0,
+        "avg_tokens_per_session": round((ti + to + cache) / len(by_session), 0) if by_session else 0,
+        "avg_tokens_per_metered": round((ti + to + cache) / len(events), 0) if events else 0,
+    }
+    biggest_day = max(day_entries, key=lambda d: d["total"]) if day_entries else None
+    top_model = model_rows[0] if model_rows else None
+    biggest_req = max(events, key=lambda e: e["total"]) if events else None
+    biggest_sess = max(sessions, key=lambda s: s["tokens_total"]) if sessions else None
+    peak_hour = max(range(24), key=lambda h: hour_tokens.get(h, 0)) if any(hour_tokens.values()) else None
+    insights = [
+        f"Cline ran {len(events):,} assistant messages across {len(by_session)} sessions"
+        f" and {len(by_model)} models.",
+        (f"Top model: {router_short(top_model[0])} — {top_model[2]:,.0f} tokens over {top_model[1]:,} messages."
+         if top_model else ""),
+        (f"Busiest day: {biggest_day['date']} — {biggest_day['total']:,.0f} tokens, {biggest_day['reqs']} messages."
+         if biggest_day else "No Cline activity recorded yet."),
+    ]
+    if unmetered:
+        insights.append(
+            f"{unmetered:,} assistant messages reported no token counts — excluded from all counts."
+        )
+    if truncated_scan:
+        insights.append(
+            f"Showing the most recent {len(events):,} of the scanned Cline messages — totals cover that window only."
+        )
+    insights = [i for i in insights if i]
+    return {
+        "source": "cline",
+        "source_label": "Cline data",
+        "totals": totals,
+        "models": model_rows,
+        "providers": sorted([[k, v["reqs"], round(v["toks"], 1)] for k, v in by_provider.items()],
+                            key=lambda kv: -kv[2]),
+        "sessions": sessions,
+        "days": day_entries,
+        "hours": [hour_reqs.get(h, 0) for h in range(24)],
+        "commits": c_commit_rows,
+        "activity": activity,
+        "requests": recent,
+        "insights": insights,
+        "records": {
+            "biggest_day": {"date": biggest_day["date"], "total": biggest_day["total"],
+                            "sessions": biggest_day["reqs"]} if biggest_day else None,
+            "biggest_session": {"title": biggest_sess["title"], "total": biggest_sess["tokens_total"],
+                                "model": biggest_sess["model"]} if biggest_sess else None,
+            "fastest_burn": None,
+            "biggest_model": {"name": top_model[0], "total": top_model[2],
+                              "requests": top_model[1]} if top_model else None,
+            "biggest_request": {"at": biggest_req["at"], "model": biggest_req["model"],
+                                "total": biggest_req["total"]} if biggest_req else None,
+            "peak_hour": peak_hour,
+            "streaks": compute_streaks(activity),
+        },
+        "range": f"{day_entries[0]['date']} → {day_entries[-1]['date']}" if day_entries else "no activity",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "scanned": len(events),
+        "truncated": truncated_scan,
+    }
+
+
+def blank_cline_stats(error=None):
+    """Well-formed empty Cline payload (same shape as query_cline_stats)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    stats = {
+        "source": "cline",
+        "source_label": "Cline data",
+        "totals": {"requests": 0, "ok": 0, "errors": 0, "err429": 0, "err500": 0,
+                   "unmetered": 0,
+                   "tokens_input": 0, "tokens_output": 0, "tokens_reasoning": 0,
+                   "tokens_cache_read": 0, "tokens_cache_write": 0, "tokens_total": 0,
+                   "cache_rate": 0.0, "models": 0, "providers": 0, "what_if_cost": 0,
+                   "avg_ms": 0, "sessions": 0, "messages": 0, "cost": 0,
+                   "avg_duration_min": 0, "avg_tokens_per_session": 0,
+                   "avg_tokens_per_metered": 0},
+        "models": [],
+        "providers": [],
+        "sessions": [],
+        "days": [],
+        "hours": [0] * 24,
+        "commits": [],
+        "activity": zero_days_window(),
+        "requests": [],
+        "insights": ["No Cline activity found."],
+        "records": {"biggest_day": None, "biggest_session": None,
+                    "fastest_burn": None, "biggest_model": None,
+                    "biggest_request": None, "peak_hour": None,
+                    "streaks": {"current": 0, "longest": 0}},
+        "range": "no activity",
+        "generated_at": now,
+        "scanned": 0,
+        "truncated": False,
+    }
+    if error:
+        stats["error"] = error
+    return stats
+
+
+def _cline_fingerprint(cline_dir):
+    base = Path(cline_dir)
+    fps = []
+    db = base / "db" / "sessions.db"
+    for q in [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]:
+        try:
+            st = q.stat()
+            fps.append((str(q), st.st_mtime_ns, st.st_size))
+        except OSError:
+            fps.append((str(q), None, None))
+    newest = (None, None)
+    try:
+        for p in (base / "sessions").glob("*/*.messages.json"):
+            try:
+                st = p.stat()
+                if newest[0] is None or st.st_mtime_ns > newest[0]:
+                    newest = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    fps.append(("cline-newest-messages", newest[0], newest[1]))
+    return tuple(fps)
+
+
+def cached_cline_stats(cline_dir, worktrees=None):
+    try:
+        fingerprint = (_cline_fingerprint(cline_dir), repo_heads(worktrees))
+    except OSError:
+        raise RuntimeError(f"Cline sessions dir not found: {Path(cline_dir) / 'sessions'}")
+    with LOCK:
+        if CLINE_CACHE.get("key") == fingerprint and CLINE_CACHE.get("stats") is not None:
+            return CLINE_CACHE["stats"]
+    stats = query_cline_stats(cline_dir, worktrees)
+    with LOCK:
+        CLINE_CACHE["key"] = fingerprint
+        CLINE_CACHE["stats"] = stats
+    return stats
+
+
 def session_prompts(con, session_id):
     """Prompts for one session — from session_input when available, otherwise
     reconstructed from user text parts (older opencode versions)."""
@@ -1599,6 +2031,31 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .hbar:hover{filter:brightness(1.15)}
 .pbtn[aria-pressed="true"]{background:color-mix(in srgb,var(--accent) 14%,transparent);border-color:var(--accent);color:var(--accent)}
 @media(max-width:700px){.model-row{grid-template-columns:1fr;gap:6px}.model-row .mv{text-align:left}}
+/* settings menu */
+.setmenu{position:absolute;right:0;top:calc(100% + 6px);z-index:50;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;box-shadow:var(--shadow);padding:8px;display:none;min-width:210px}
+.setmenu.open{display:block}
+.setmenu label{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:600;color:var(--text);
+  padding:8px 10px;border-radius:7px;cursor:pointer}
+.setmenu label:hover{background:var(--chip)}
+.setmenu input{accent-color:var(--accent);width:15px;height:15px}
+.setmenu .shint{font-size:11px;color:var(--subtle);padding:6px 10px 4px;line-height:1.5}
+/* recap tab (YT Shorts recording view) */
+.recap-hero{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px 28px;
+  box-shadow:var(--shadow);margin-top:22px;text-align:center}
+.recap-date{font-family:var(--mono);font-size:12px;letter-spacing:.12em;color:var(--subtle);text-transform:uppercase}
+.recap-big{font-family:var(--mono);font-size:clamp(44px,9vw,76px);font-weight:800;letter-spacing:-.04em;
+  line-height:1.05;margin-top:8px;font-variant-numeric:tabular-nums}
+.recap-big small{font-size:clamp(14px,2.5vw,20px);color:var(--subtle);font-weight:600;letter-spacing:0}
+.recap-sub{font-size:13px;color:var(--muted);margin-top:8px}
+.recap-split{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:16px}
+.recap-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+.recap-card .rl{font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--subtle)}
+.recap-card .rv{font-family:var(--mono);font-size:24px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
+.recap-card .rs{font-size:11.5px;color:var(--muted);margin-top:4px}
+.recap-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;margin-top:16px}
+.recap-controls input[type=date]{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:7px 11px;
+  font-family:var(--sans);font-size:12.5px;color:var(--text);outline:none}
 </style>
 </head>
 <body>
@@ -1612,6 +2069,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div class="expmenu" id="expmenu">
         <button data-x="json">JSON <small>full stats payload</small></button>
         <button data-x="csv">CSV <small>per-day usage table</small></button>
+        <button data-x="recap">Recap CSV <small>all harnesses per day</small></button>
+      </div></span>
+    <span class="export-wrap"><button class="tbtn" id="settings" aria-haspopup="true">⚙ Harnesses</button>
+      <div class="setmenu" id="setmenu" role="menu" aria-label="Harness toggles">
+        <label><input type="checkbox" id="set-opencode" checked> OpenCode</label>
+        <label><input type="checkbox" id="set-router" checked> Codex</label>
+        <label><input type="checkbox" id="set-cline" checked> Cline</label>
+        <div class="shint">Disabled harnesses hide their tab and are excluded from the Recap tab.</div>
       </div></span>
     <button class="tbtn" id="refresh">⟳ Refresh</button>
   </div>
@@ -1621,6 +2086,8 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="source-tabs" role="tablist" aria-label="Data source">
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
+    <button class="stab" id="tab-cline" role="tab" aria-selected="false" aria-controls="view-cline">Cline<span class="cnt" id="tab-cline-cnt"></span></button>
+    <button class="stab" id="tab-recap" role="tab" aria-selected="false" aria-controls="view-recap">Recap<span class="cnt" id="tab-recap-cnt"></span></button>
   </div>
   <div id="view-opencode" role="tabpanel" aria-labelledby="tab-opencode">
   <section class="hero">
@@ -1798,13 +2265,123 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-legend" id="r-act-legend"></div>
   </div>
   </div><!-- /view-router -->
+  <div id="view-cline" role="tabpanel" aria-labelledby="tab-cline" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="c-range"></div>
+    <h1 id="c-headline"></h1>
+    <div class="pills" id="c-pills"></div>
+    <section class="summary" id="c-summary" aria-label="Cline token summary"></section>
+    <div class="presets" id="c-presets" role="group" aria-label="Cline time range">
+      <span class="pl">Period</span>
+      <button class="pbtn active" data-cr="all">All time</button>
+      <button class="pbtn" data-cr="7">7 days</button>
+      <button class="pbtn" data-cr="30">30 days</button>
+      <button class="pbtn" data-cr="90">90 days</button>
+      <button class="pbtn" data-cr="365">1 year</button>
+      <span class="pl" style="margin-left:14px">View</span>
+      <button class="pbtn" id="c-share-btn" aria-pressed="false" title="Show 100% share instead of absolute tokens">Share: off</button>
+    </div>
+  </section>
+  <section class="kpis" id="c-kpis"></section>
+
+  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
+  <section class="records" id="c-records"></section>
+
+  <h2 class="sec">Notes on your usage <span class="hint" id="c-notes-hint">generated from your cline data</span></h2>
+  <section class="insights" id="c-insights"></section>
+
+  <h2 class="sec">Tokens per day <span class="hint">input · output · cache · click a day to filter</span></h2>
+  <div class="card chart-card">
+    <div class="ctitle">Tokens per day <small id="c-tok-sub">stacked absolute</small></div>
+    <div id="c-tok-chart"></div>
+    <div class="legend" id="c-tok-legend"></div>
+  </div>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card chart-card">
+      <div class="ctitle">Tokens by file / subsystem <small id="c-file-sub">from local edit + write touches</small></div>
+      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Files or subsystems">
+        <button class="pbtn active" data-cfs="file">Files</button>
+        <button class="pbtn" data-cfs="sub">Subsystems</button>
+      </div>
+      <div id="c-file-chart" class="crows"></div>
+    </div>
+    <div class="card chart-card">
+      <div class="ctitle">Tokens per commit <small id="c-commit-sub">prior 24h messages · time-matched</small></div>
+      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
+        <button class="pbtn active" data-ccs="toks">By tokens</button>
+        <button class="pbtn" data-ccs="recent">Recent</button>
+      </div>
+      <div id="c-commit-chart" class="crows"></div>
+    </div>
+  </div>
+
+  <h2 class="sec">Tokens by model <span class="hint">universal comparison · click a model to filter</span></h2>
+  <div class="card" id="c-model-card"><div id="c-models"></div><div class="legend" id="c-model-legend"></div></div>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card"><div class="ctitle">Providers <small>message leaderboard</small></div><div class="chips" id="c-providers"></div></div>
+    <div class="card"><div class="ctitle">Sessions <small>click to filter</small></div><div class="chips" id="c-sessions"></div></div>
+  </div>
+
+  <h2 class="sec">Sessions <span class="hint" id="c-req-hint"></span></h2>
+  <div class="card">
+    <div class="tbl-tools">
+      <input class="search" id="c-search" placeholder="Filter by title, model or directory…" aria-label="Filter cline sessions">
+      <select class="filter" id="c-provider-f"><option value="">All providers</option></select>
+      <select class="filter" id="c-model-f"><option value="">All models</option></select>
+      <span class="badge" id="c-req-count"></span>
+    </div>
+    <div id="c-fbar" class="fbar" style="display:none"></div>
+    <div class="tbl-scroll">
+      <table class="tbl" id="c-tbl">
+        <thead><tr>
+          <th>Session</th><th>Model</th><th>Started</th>
+          <th class="num">Input</th><th class="num">Output</th>
+          <th class="num">Cache</th><th class="num">Total</th><th class="num">Msgs</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2 class="sec">Activity <span class="hint">last 52 weeks · token intensity · click to filter</span></h2>
+  <div class="card">
+    <div class="act-head"><span class="sum" id="c-act-summary"></span></div>
+    <div class="act-scroll"><div id="c-act"></div></div>
+    <div class="act-legend" id="c-act-legend"></div>
+  </div>
+  </div><!-- /view-cline -->
+  <div id="view-recap" role="tabpanel" aria-labelledby="tab-recap" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow">RECAP · DAILY TOKENS FOR RECORDING</div>
+    <h1>How many tokens did I use?</h1>
+  </section>
+  <div class="recap-hero">
+    <div class="recap-date" id="recap-date"></div>
+    <div class="recap-big" id="recap-big"></div>
+    <div class="recap-sub" id="recap-sub"></div>
+    <div class="recap-controls" role="group" aria-label="Recap date">
+      <button class="pbtn active" data-recap="today">Today</button>
+      <button class="pbtn" data-recap="yesterday">Yesterday</button>
+      <input type="date" id="recap-picker" aria-label="Pick a recap date">
+      <button class="pbtn" id="recap-copy">⧉ Copy for Shorts</button>
+    </div>
+  </div>
+  <div class="recap-split" id="recap-split"></div>
+  <h2 class="sec">Providers <span class="hint">enabled harnesses · selected date</span></h2>
+  <div class="card"><div class="chips" id="recap-providers"></div></div>
+  <h2 class="sec">Conversations <span class="hint" id="recap-conv-hint">top by tokens · selected date</span></h2>
+  <div class="card"><div class="tbl-scroll"><table class="tbl" id="recap-tbl">
+    <thead><tr><th>Conversation</th><th>Harness</th><th>Model</th><th class="num">Tokens</th></tr></thead>
+    <tbody></tbody>
+  </table></div></div>
+  </div><!-- /view-recap -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
 <div class="tip" id="tip"></div>
 <div class="toasts" id="toasts"></div>
 
-<script>const S0 = __DATA__; const R0 = __ROUTER__;</script>
+<script>const S0 = __DATA__; const R0 = __ROUTER__; const C0 = __CLINE__;</script>
 <script>
 const $=id=>document.getElementById(id);
 const ESC=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1818,15 +2395,23 @@ const DUR=m=>{if(m==null)return'—';if(m<1)return'<1m';if(m<60)return Math.roun
 const BURN=b=>{b=Number(b)||0;return b>=1000?(b/1000).toFixed(1)+'K/m':Math.round(b)+'/m';};
 let S=null; if(typeof S0!=='undefined'&&S0){S=S0;}
 let R=null; try{if(typeof R0!=='undefined'&&R0){R=R0;}}catch(_){R=null;}
+let C=null; try{if(typeof C0!=='undefined'&&C0){C=C0;}}catch(_){C=null;}
 let TAB='opencode';
 let sortK='time_created', sortAsc=false;
 let RANGE='all', SPLIT=false, SHARE=false;
 let RRANGE='all', RSPLIT=false, RSHARE=false;
-let FS='file', CS='toks', RFS='file', RCS='toks';
-let FS_EXP=false, CS_EXP=false, RFS_EXP=false, RCS_EXP=false;
+let CRANGE='all', CSHARE=false;
+let FS='file', CS='toks', RFS='file', RCS='toks', CFS='file', CCS='toks';
+let FS_EXP=false, CS_EXP=false, RFS_EXP=false, RCS_EXP=false, CFS_EXP=false, CCS_EXP=false;
 let currentRows=[];
 let currentRRows=[];
+let currentCRows=[];
 const RFSTATE={day:null,model:null,provider:null,status:''};
+const CFSTATE={day:null,model:null,provider:null,session:null};
+/* harness toggles (Settings gear) + recap date */
+let HARNESS={opencode:true,router:true,cline:true};
+try{const h=JSON.parse(localStorage.getItem('ocd-harness')||'null');if(h&&typeof h==='object'){HARNESS={opencode:h.opencode!==false,router:h.router!==false,cline:h.cline!==false};}}catch(_){}
+let RECAP_DATE=new Date().toLocaleDateString('en-CA');
 const WID=sessionStorage.getItem('ocd-wid')||('w'+Math.random().toString(36).slice(2));
 sessionStorage.setItem('ocd-wid',WID);
 const FSTATE={day:null,model:null,agent:null,file:null,sub:null,commit:null};
@@ -1864,7 +2449,7 @@ const T=()=>THEMES[theme];
 function syncThemeBtn(){$('theme').textContent=theme==='dark'?'☀ Light':'◐ Dark';}
 syncThemeBtn();
 $('theme').onclick=()=>{theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;
-  localStorage.setItem('ocd-theme',theme);syncThemeBtn();renderAll();renderRouter();};
+  localStorage.setItem('ocd-theme',theme);syncThemeBtn();renderAll();renderRouter();renderCline();if(TAB==='recap')renderRecap();};
 /* svg */
 const svg=(tag,at,html)=>'<'+tag+Object.entries(at).map(([k,v])=>' '+k+'="'+ESC(v)+'"').join('')+'>'+(html||'')+'</'+tag+'>';
 const dayTotal=d=>(d.ti||0)+(d.to||0)+(d.tr||0)+(d.cache||0);
@@ -2038,6 +2623,7 @@ function deltaTag(cur,prev){const p=deltaPct(cur,prev);if(p==null)return'';
 function renderAll(){
   if(!S)return;
   renderHero();renderSummary();renderKpis();renderRecords();renderInsights();renderCharts();renderModels();renderProjAgents();renderAct();renderFilterBar();renderSessions();
+  updateTabCounts();
 }
 function renderHero(){
   const periodLbl=RANGE==='all'?'ALL TIME':(RANGE/30>=1?RANGE/30+' MO':RANGE+' DAYS');
@@ -2597,6 +3183,7 @@ function renderRouter(){
   const oc=(S&&S.totals?S.totals.tokens_total:0)||0;
   $('tab-opencode-cnt').textContent=FN(oc);
   $('tab-router-cnt').textContent=F(t.requests||0)+' req';
+  updateTabCounts();
 }
 function routerRequestRows(){
   const q=(($('r-search')||{}).value||'').toLowerCase();
@@ -2638,17 +3225,451 @@ function renderRouterRequests(){
     '<td class="num" style="font-weight:700">'+FN(r.total||0)+'</td><td class="num" style="color:var(--subtle)">'+F(r.ms||0)+'</td></tr>';}).join('')
     ||'<tr><td colspan="8"><div class="empty">No requests match.</div></td></tr>';
 }
+/* ---- Cline tab (Desktop app, from ~/.cline/data) ---- */
+function cModelShort(m){return (m||'—').split('/').pop();}
+function cDayTotal(d){return (d.ti||0)+(d.to||0)+(d.tr||0)+(d.cache||0);}
+function cCutDate(){
+  if(CRANGE==='all')return'';
+  const d=new Date(Date.now()-CRANGE*86400000);
+  return d.toLocaleDateString('en-CA');
+}
+function cInPeriod(day){const c=cCutDate();return !c||day.date>=c;}
+function cPeriodDays(){return (C&&C.days?C.days:[]).filter(cInPeriod);}
+function cSumDays(list){
+  const t={reqs:0,ok:0,ti:0,to:0,tr:0,cache:0,total:0};
+  list.forEach(d=>{t.reqs+=d.reqs||0;t.ok+=d.ok||0;t.ti+=d.ti||0;t.to+=d.to||0;t.tr+=d.tr||0;t.cache+=d.cache||0;t.total+=cDayTotal(d);});
+  return t;
+}
+function cDayTip(d){
+  return '<b>'+d.date+'</b>'+
+    '<span class="trow"><span>Messages</span><b>'+F(d.reqs||0)+'</b></span>'+
+    '<span class="trow"><span>Input</span><b>'+FN(d.ti)+'</b></span>'+
+    '<span class="trow"><span>Output</span><b>'+FN(d.to||0)+'</b></span>'+
+    '<span class="trow"><span>Cache</span><b>'+FN(d.cache||0)+'</b></span>'+
+    '<span class="trow"><span>Total</span><b>'+FN(cDayTotal(d))+'</b></span>';
+}
+function cStackChart(days){
+  const t=T();
+  const keys=[{p:'ti',c:t.accent,l:'Input'},{p:'to',c:t.accent2,l:'Output'},{p:'cache',c:t.cache,l:'Cache'}];
+  const val=(d,k)=>(d[k.p]||0);
+  const w=980,h=250,p=34;
+  let max=1;
+  if(CSHARE){max=100;}
+  else{max=Math.max(...days.map(d=>keys.reduce((a,k)=>a+val(d,k),0)),1);}
+  const Y=v=>p+(1-v/max)*(h-2*p),X=i=>days.length>1?p+i*(w-2*p)/(days.length-1):p+(w-2*p)/2;
+  const slot=(w-2*p)/Math.max(days.length,1);
+  const sw=Math.min(slot*0.32,p*0.85);
+  const step=Math.ceil(days.length/12)||1;
+  let cells='',xl='';
+  days.forEach((day,i)=>{
+    const tot=keys.reduce((a,k)=>a+val(day,k),0);
+    let acc=0;
+    const x1=X(i)-sw,x2=X(i)+sw;
+    keys.forEach(k=>{
+      const v=val(day,k);
+      if(CSHARE){
+        const share0=acc/(tot||1)*100||0;
+        acc+=v;
+        const share1=acc/(tot||1)*100||0;
+        const y0=Y(share1),y1=Y(share0);
+        if(!v)return;
+        cells+=svg('path',{d:'M'+x1.toFixed(1)+','+y0.toFixed(1)+' L'+x2.toFixed(1)+','+y0.toFixed(1)+' L'+x2.toFixed(1)+','+y1.toFixed(1)+' L'+x1.toFixed(1)+','+y1.toFixed(1)+' Z',
+          fill:k.c,class:'inter'+(CFSTATE.day&&CFSTATE.day!==day.date?' dim':''),'data-tip':'<b>'+k.l+' · '+day.date+'</b><span class="trow"><span>Tokens</span><b>'+FN(v)+'</b></span>'});
+      }else{
+        if(!v)return;
+        cells+=svg('path',{d:'M'+x1.toFixed(1)+','+Y(acc+v).toFixed(1)+' L'+x2.toFixed(1)+','+Y(acc+v).toFixed(1)+' L'+x2.toFixed(1)+','+Y(acc).toFixed(1)+' L'+x1.toFixed(1)+','+Y(acc).toFixed(1)+' Z',
+          fill:k.c,class:'inter'+(CFSTATE.day&&CFSTATE.day!==day.date?' dim':''),'data-tip':'<b>'+k.l+' · '+day.date+'</b><span class="trow"><span>Tokens</span><b>'+FN(v)+'</b></span>'});
+        acc+=v;
+      }
+    });
+    cells+=svg('rect',{x:(X(i)-slot/2).toFixed(1),y:p,width:(slot*0.96).toFixed(1),height:(h-2*p).toFixed(1),fill:'transparent',
+      class:'inter'+(CFSTATE.day&&CFSTATE.day!==day.date?' dim':''),'data-tip':cDayTip(day),'data-cday':day.date});
+    if(i%step===0)xl+=svg('text',{x:X(i).toFixed(1),y:h-p+17,'text-anchor':'middle',fill:'#9a968c','font-size':10},day.date.slice(5));
+  });
+  const sub=$('c-tok-sub');
+  if(sub)sub.textContent=(CSHARE?'100% share':'stacked absolute')+' · output merged';
+  return '<svg viewBox="0 0 '+w+' '+(h+10)+'" width="100%">'+cells+xl+'</svg>';
+}
+function cFileRows(){
+  return (CFS==='file'?((S&&S.files)||[]):((S&&S.subsystems)||[]))||[];
+}
+function renderClineFileChart(){
+  const el=$('c-file-chart');if(!el)return;
+  const rows=cFileRows();
+  const sub=$('c-file-sub');
+  if(sub)sub.textContent=(CFS==='file'?'top files · equal-split':'top subsystems')+' · from local edit + write touches';
+  if(!S||!rows.length){el.innerHTML='<div class="empty">No local file data to mirror.</div>';return;}
+  const t=T();
+  const totalAll=rows.reduce((a,r)=>a+(r[1]||0),0)||1;
+  const max=Math.max(...rows.map(r=>r[1]||0),1);
+  const shown=CFS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
+    const name=r[0],toks=r[1]||0,n=r[2]||0,avg=r[3]||0;
+    const short=CFS==='file'?shortPath(name):name;
+    const tip='<b>'+ESC(name)+'</b><span class=\'trow\'><span>Tokens</span><b>'+FN(toks)+'</b></span>'+
+      '<span class=\'trow\'><span>Sessions</span><b>'+n+'</b></span><span class=\'trow\'><span>Avg / session</span><b>'+FN(avg)+'</b></span>'+
+      '<span class=\'trow\'><span>Source</span><b>local touches</b></span>';
+    return '<div class="model-row" data-tip="'+tip+'">'+
+      '<div><div class="mn">'+ESC(short)+'</div><div class="ms">'+n+' sess · avg '+FN(avg)+'</div></div>'+
+      '<div class="mbar"><i style="width:'+(toks/max*100).toFixed(1)+'%;background:'+(CFS==='file'?t.accent:t.accent2)+'"></i></div>'+
+      '<div class="mv">'+FN(toks)+'</div></div>';
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cfs">'+(CFS_EXP?'Show less':'Show all '+rows.length)+' '+(CFS_EXP?'▴':'▾')+'</button>':'');
+}
+function cCommitRows(){
+  const cut=CRANGE==='all'?0:Date.now()-CRANGE*86400000;
+  let rows=((C&&C.commits)||[]).filter(c=>{
+    if(CFSTATE.day&&c[2]!==CFSTATE.day)return false;
+    if(cut){
+      const ms=Date.parse(c[2]+'T00:00:00');
+      if(ms&&ms<cut-86400000)return false;
+    }
+    return true;
+  });
+  rows=rows.slice();
+  if(CCS==='recent')rows.sort((a,b)=>a[2]<b[2]?1:-1);
+  else rows.sort((a,b)=>(b[7]||0)-(a[7]||0));
+  return rows.slice(0,20);
+}
+function renderClineCommitChart(){
+  const el=$('c-commit-chart');if(!el)return;
+  const rows=cCommitRows();
+  const sub=$('c-commit-sub');
+  if(sub)sub.textContent='prior 24h messages · time-matched';
+  if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
+  const t=T();
+  const max=Math.max(...rows.map(r=>r[7]||0),1);
+  const shown=CCS_EXP?rows:rows.slice(0,6);
+  el.innerHTML=shown.map(r=>{
+    const sha=r[0],msg=r[1]||'(no message)',date=r[2],proj=r[3],nf=r[4]||0,add=r[5]||0,del=r[6]||0,toks=r[7]||0,nq=r[8]||0;
+    const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
+      '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
+      '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
+      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+nq+' messages</b></span>';
+    return '<div class="model-row" data-tip="'+tip+'">'+
+      '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
+      '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
+      '<div class="mbar"><i style="width:'+Math.max(toks?2:0,toks/max*100).toFixed(1)+'%;background:'+t.accent2+'"></i></div>'+
+      '<div class="mv">'+(toks?FN(toks):'—')+'</div></div>';
+  }).join('')+(rows.length>6?'<button class="more-btn" data-exp="ccs">'+(CCS_EXP?'Show less':'Show all '+rows.length)+' '+(CCS_EXP?'▴':'▾')+'</button>':'');
+}
+function cHumanize(n){n=Number(n)||0;const words=Math.round(n/1.3);if(words>1e6)return (words/1e6).toFixed(1)+'M words';if(words>1e3)return (words/1e3).toFixed(0)+'K words';return words+' words';}
+function renderClineRecords(totTokens){
+  const el=$('c-records');if(!el||!C.records)return;
+  const r=C.records;
+  const cards=[];
+  if(r.biggest_day)cards.push(['Biggest day',FN(r.biggest_day.total),r.biggest_day.date+' · '+r.biggest_day.sessions+' messages · '+cHumanize(r.biggest_day.total)]);
+  if(r.biggest_model)cards.push(['Biggest model',FN(r.biggest_model.total),cModelShort(r.biggest_model.name)+' · '+F(r.biggest_model.requests)+' messages']);
+  if(r.biggest_session)cards.push(['Biggest session',FN(r.biggest_session.total),(r.biggest_session.title||'').slice(0,48)]);
+  if(r.streaks)cards.push(['Streaks',r.streaks.current+'d now','longest '+r.streaks.longest+'d · '+cHumanize(totTokens)+' total']);
+  el.innerHTML=cards.map(([l,v,s])=>'<div class="rec"><div class="rl">'+l+'</div><div class="rv">'+ESC(v)+'</div><div class="rs">'+ESC(s)+'</div></div>').join('')||'<div class="empty">No records yet.</div>';
+}
+function renderClineAct(){
+  const act=(C&&C.activity)||[];
+  const $w=$('c-act');
+  const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  if(!act.length){$w.innerHTML='<div class="empty">Nothing yet.</div>';$('c-act-summary').textContent='';$('c-act-legend').innerHTML='';return;}
+  const today=new Date().toLocaleDateString('en-CA');
+  const cols=[];let cur=null;
+  act.forEach(dd=>{
+    const dt=new Date(dd.date+'T00:00:00');
+    const dow=(dt.getDay()+6)%7;
+    if(dow===0||!cur){cur={days:new Array(7).fill(null),month:dt.getMonth()};cols.push(cur);}
+    cur.days[dow]=dd;
+  });
+  const mx=Math.max(...act.map(dd=>cDayTotal(dd)),1);
+  const lvl=v=>{if(!v)return 0;const tt=v/mx;return tt>=0.75?4:tt>=0.5?3:tt>=0.3?2:1;};
+  const pc=[0,18,34,52,70,86];
+  const cell=(dd)=>{
+    const tot=dd?cDayTotal(dd):0;
+    const lv=lvl(tot);
+    const bg=lv?'color-mix(in srgb,'+T().accent+' '+pc[lv]+'%, var(--bg))':'var(--chip)';
+    const tipH=dd?('<b>'+dd.date+'</b><span class="trow"><span>Total tokens</span><b>'+FN(tot)+'</b></span>'+
+      '<span class="trow"><span>Messages</span><b>'+F(dd.reqs||dd.msgs||0)+'</b></span>'):'';
+    const f=dd?' data-tip=\''+tipH+'\' data-cday="'+dd.date+'"':'';
+    return '<button class="act-cell'+(dd&&dd.date===today?' today':'')+(dd&&CFSTATE.day&&CFSTATE.day!==dd.date?' dim':'')+'" '+
+      'style="background:'+bg+'" aria-label="'+(dd?dd.date+', '+FN(tot)+' tokens':'No activity')+'"'+f+'></button>';
+  };
+  let monthHtml='',i=0;
+  while(i<cols.length){const m=cols[i].month;let j=i;while(j<cols.length&&cols[j].month===m)j++;
+    monthHtml+='<span style="width:'+((j-i)*(12+3)-3)+'px">'+MONTHS[m]+'</span>';i=j;}
+  const labels=['Mon','Wed','Fri'].map(dd=>'<span>'+dd+'</span>').join('');
+  $w.innerHTML='<div class="act-grid"><div class="act-months">'+monthHtml+'</div>'+
+    '<div class="act-body"><div class="act-labels">'+labels+'</div>'+
+    '<div class="act-cols">'+cols.map(cc=>'<div class="act-col">'+cc.days.map(cell).join('')+'</div>').join('')+'</div></div></div>';
+  const active=act.filter(dd=>cDayTotal(dd)>0).length;
+  const tot=act.reduce((a,dd)=>({tokens:a.tokens+cDayTotal(dd),reqs:a.reqs+(dd.reqs||dd.msgs||0)}),{tokens:0,reqs:0});
+  $('c-act-summary').innerHTML='<b>'+active+'</b> active days · <b>'+FN(tot.tokens)+'</b> tokens · '+
+    '<b>'+F(tot.reqs)+'</b> messages in the last 52 weeks';
+  $('c-act-legend').innerHTML='Less <span class="sw e"></span>'+
+    [1,2,3,4].map(l=>'<span class="sw" style="background:color-mix(in srgb,'+T().accent+' '+pc[l]+'%, var(--bg))"></span>').join('')+' More <span style="margin-left:8px">token intensity</span>';
+}
+function renderClineFilterBar(){
+  const bar=$('c-fbar');
+  const active=Object.entries(CFSTATE).filter(([k,v])=>v);
+  if(!active.length){bar.style.display='none';return;}
+  bar.style.display='flex';
+  const labels={day:'Day',model:'Model',provider:'Provider',session:'Session'};
+  const disp=(k,v)=>k==='model'?cModelShort(v):(k==='session'?String(v).slice(-8):v);
+  bar.innerHTML='<span class="fl">Filtering:</span>'+active.map(([k,v])=>
+    '<span class="fchip" data-ck="'+k+'">'+labels[k]+': '+ESC(disp(k,v))+' <span class="fx">✕</span></span>').join('')
+    +'<button class="fclear">clear all</button>';
+  bar.querySelectorAll('.fchip').forEach(ch=>ch.onclick=()=>{
+    const k=ch.dataset.ck;CFSTATE[k]=null;
+    if(k==='provider')$('c-provider-f').value='';
+    if(k==='model')$('c-model-f').value='';
+    renderCline();
+  });
+  bar.querySelector('.fclear').onclick=()=>{for(const k in CFSTATE)CFSTATE[k]=null;$('c-provider-f').value='';$('c-model-f').value='';renderCline();};
+}
+function clineSessionRows(){
+  const q=(($('c-search')||{}).value||'').toLowerCase();
+  const cut=CRANGE==='all'?0:Date.now()-CRANGE*86400000;
+  return (C.sessions||[]).filter(s=>{
+    if(CFSTATE.model&&s.model!==CFSTATE.model)return false;
+    if(CFSTATE.provider&&s.provider!==CFSTATE.provider)return false;
+    if(CFSTATE.session&&s.id!==CFSTATE.session)return false;
+    if(CFSTATE.day&&DS(s.time_created)!==CFSTATE.day)return false;
+    if(cut&&s.time_created&&s.time_created<cut)return false;
+    if(q&&!(s.title||'').toLowerCase().includes(q)&&!(s.model||'').toLowerCase().includes(q)&&!(s.worktree||'').toLowerCase().includes(q))return false;
+    return true;});
+}
+function renderClineSessions(){
+  const rows=clineSessionRows();
+  currentCRows=rows;
+  $('c-req-count').textContent=F(rows.length)+' of '+F((C.sessions||[]).length)+' shown';
+  const rf=Object.values(CFSTATE).filter(Boolean).length;
+  const ct=(C&&C.totals)||{};
+  $('c-req-hint').textContent=(rf?'filtered by '+rf+' criteria · ':'')+F(rows.length)+' sessions · '+F(ct.messages||0)+' messages counted'+
+    (C&&C.truncated?' (capped at recent '+F(C.scanned||0)+')':'')+' · '+F(ct.unmetered||0)+' unmetered excluded';
+  const tb=$('c-tbl').querySelector('tbody');
+  tb.innerHTML=rows.map(s=>{
+    const tot=s.tokens_total||((s.tokens_input||0)+(s.tokens_output||0)+(s.tokens_cache||0));
+    return '<tr><td><div class="t" style="font-size:12.5px">'+ESC((s.title||s.id||'Untitled').slice(0,80))+'</div>'+
+    '<div class="badges"><span class="badge">'+ESC(s.worktree||'—')+'</span></div></td>'+
+    '<td><div class="badges mix"><span class="badge model">'+ESC(cModelShort(s.model))+'</span><span class="badge agent">'+ESC(s.provider||'cline')+'</span></div></td>'+
+    '<td class="mono" style="font-size:11.5px;color:var(--muted)">'+DT(s.time_created)+'</td>'+
+    '<td class="num">'+FN(s.tokens_input||0)+'</td><td class="num">'+FN(s.tokens_output||0)+'</td><td class="num">'+FN(s.tokens_cache||0)+'</td>'+
+    '<td class="num" style="font-weight:700">'+FN(tot)+'</td><td class="num" style="color:var(--subtle)">'+F(s.msgs)+'</td></tr>';}).join('')
+    ||'<tr><td colspan="8"><div class="empty">No sessions match.</div></td></tr>';
+}
+function renderCline(){
+  if(!C)return;
+  const t=C.totals||{};
+  const periodLbl=CRANGE==='all'?'ALL TIME':(CRANGE/30>=1?CRANGE/30+' MO':CRANGE+' DAYS');
+  $('c-range').textContent='CLINE · '+(C.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const cur=CRANGE==='all'?null:cSumDays(cPeriodDays());
+  const totTokens=cur?cur.total:(t.tokens_total||0);
+  const totMsgs=cur?cur.reqs:(t.requests||0);
+  $('c-headline').innerHTML=BOLD(ESC(F(totMsgs)+' messages · '+Math.round(totTokens).toLocaleString('en-US')+' tokens with Cline.'));
+  const nModels=(C.models||[]).length;
+  $('c-pills').innerHTML=[
+    ['Messages',F(totMsgs)],
+    ['Tokens',FN(totTokens)],
+    ['Sessions',F(cur?new Set((C.sessions||[]).filter(s=>!cCutDate()||DS(s.time_created)>=cCutDate()).map(s=>s.id)).size:(t.sessions||0))],
+    ['Models',F(nModels)]]
+    .map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
+  const t7=(()=>{const now=new Date();now.setHours(0,0,0,0);const s=new Date(now);s.setDate(s.getDate()-6);
+    return cSumDays((C.days||[]).filter(d=>d.date>=s.toLocaleDateString('en-CA')));})();
+  const t30=(()=>{const now=new Date();now.setHours(0,0,0,0);const s=new Date(now);s.setDate(s.getDate()-29);
+    return cSumDays((C.days||[]).filter(d=>d.date>=s.toLocaleDateString('en-CA')));})();
+  const t1=(()=>{const s=new Date().toLocaleDateString('en-CA');
+    return cSumDays((C.days||[]).filter(d=>d.date>=s));})();
+  $('c-summary').innerHTML=[['Today',t1.total],['Last 7 days',t7.total],['Last 30 days',t30.total],['All time',t.tokens_total||0]]
+    .map(([l,v])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+FN(v)+'</div><div class="ss">tokens</div></div>').join('');
+  const c=T();
+  const tok=cur?{input:cur.ti,out:cur.to,ca:cur.cache}:{input:t.tokens_input,out:t.tokens_output,ca:t.tokens_cache_read};
+  const total=tok.input+tok.out+tok.ca;
+  const pct=v=>total?Math.round(v/total*100):0;
+  const row=(lbl,v,color,sub)=>'<div class="krow"><span class="lbl"><i class="dot" style="background:'+color+'"></i>'+lbl+
+    (sub?' <span class="dim">'+sub+'</span>':'')+'</span><b>'+v+'</b></div>';
+  const hitRate=(tok.input+tok.ca)?Math.round(tok.ca/(tok.input+tok.ca)*100):0;
+  const avgMsg=totMsgs?Math.round(total/totMsgs):0;
+  $('c-kpis').innerHTML=
+    '<div class="kpi"><h3>Tokens (output merged)</h3><div class="big">'+FN(total)+' <small>total</small></div>'+
+    '<div class="tokbar">'+[[tok.input,c.accent],[tok.out,c.accent2],[tok.ca,c.cache]].map(([v,k])=>'<i style="width:'+pct(v)+'%;background:'+k+'"></i>').join('')+'</div>'+
+    row('Input',FN(tok.input),c.accent,pct(tok.input)+'%')+row('Output',FN(tok.out),c.accent2,pct(tok.out)+'%')+
+    row('Cache',FN(tok.ca),c.cache,pct(tok.ca)+'%')+'</div>'+
+    '<div class="kpi"><h3>Cache &amp; efficiency</h3><div class="big">'+hitRate+'% <small>cache hit</small></div>'+
+    row('Cached tokens',FN(tok.ca),c.cache)+row('Avg / message',FN(avgMsg),c.accent)+
+    row('Avg tokens/session (all)',FN(t.avg_tokens_per_session||0),'var(--subtle)')+'</div>'+
+    '<div class="kpi"><h3>Burn &amp; activity</h3><div class="big">'+F(totMsgs)+' <small>messages</small></div>'+
+    row('Sessions',F(cur?new Set((C.sessions||[]).filter(s=>!cCutDate()||DS(s.time_created)>=cCutDate()).map(s=>s.id)).size:(t.sessions||0)),c.accent)+
+    row('Top model',topClineModelName(),c.accent2,'all-time')+
+    row('Unmetered',F(t.unmetered||0),'var(--subtle)','excluded')+'</div>';
+  renderClineRecords(totTokens);
+  const d=cPeriodDays();
+  $('c-tok-chart').innerHTML=d.length?cStackChart(d):'<div class="empty">Nothing in this period.</div>';
+  $('c-tok-legend').innerHTML='<span><i style="background:'+c.accent+'"></i>Input</span><span><i style="background:'+c.accent2+'"></i>Output</span><span><i style="background:'+c.cache+'"></i>Cache</span>'+(CSHARE?'<span>100% share mode</span>':'');
+  renderClineFileChart();
+  renderClineCommitChart();
+  $('c-providers').innerHTML=(C.providers||[]).map(p=>'<span class="chip'+(CFSTATE.provider===p[0]?' active':'')+'" data-cp="'+ESC(p[0])+'" data-tip="<b>'+ESC(p[0])+'</b><span class=\'trow\'><span>Messages</span><b>'+p[1]+'</b></span><span class=\'trow\'><span>Tokens</span><b>'+FN(p[2]||0)+'</b></span>">'+
+    '<b>'+FN(p[2]||p[1])+'</b><span class="n">'+ESC(p[0])+' · '+p[1]+'</span></span>').join('')||'<span class="empty">No providers</span>';
+  const sessChips=(C.sessions||[]).slice(0,8);
+  $('c-sessions').innerHTML=sessChips.map(s=>'<span class="chip'+(CFSTATE.session===s.id?' active':'')+'" data-cs="'+ESC(s.id)+'" data-tip="<b>'+ESC((s.title||s.id).slice(0,60))+'</b><span class=\'trow\'><span>Tokens</span><b>'+FN(s.tokens_total||0)+'</b></span><span class=\'trow\'><span>Messages</span><b>'+s.msgs+'</b></span>">'+
+    '<b>'+FN(s.tokens_total||0)+'</b><span class="n">'+ESC((s.title||s.id).slice(0,24))+'</span></span>').join('')||'<span class="empty">No sessions</span>';
+  const totalAll=(C.models||[]).reduce((a,m)=>a+(m[2]||0),0)||1;
+  $('c-models').innerHTML=(C.models||[]).length?(C.models||[]).map(m=>{
+    const name=m[0],reqs=m[1],tot=m[2]||0,ti=m[3]||0,to=m[4]||0,ca=m[5]||0,ok=m[6]||0;
+    const prov=m[10]||'',free=m[11];
+    const segs=[[ti,c.accent],[to,c.accent2],[ca,c.cache]];
+    const bar=segs.map(([v,k])=>'<i style="width:'+(tot?v/tot*100:0)+'%;background:'+k+'"></i>').join('');
+    const tipH=('<b>'+ESC(name)+'</b><span class=\'trow\'><span>Messages</span><b>'+reqs+'</b></span>'+
+      '<span class=\'trow\'><span>Total tokens</span><b>'+FN(tot)+' ('+(tot/totalAll*100).toFixed(1)+'%)</b></span>'+
+      '<span class=\'trow\'><span>Input / Output / Cache</span><b>'+FN(ti)+' / '+FN(to)+' / '+FN(ca)+'</b></span>'+
+      '<span class=\'trow\'><span>Provider</span><b>'+ESC(prov)+'</b></span>');
+    return '<div class="model-row clickable'+(CFSTATE.model===name?' active':'')+'" data-cm="'+ESC(name)+'" data-tip="'+tipH+'">'+
+      '<div><div class="mn">'+ESC(cModelShort(name))+(free?'<span class="free-tag">free</span>':'')+'</div><div class="ms">'+reqs+' msg · '+(tot/totalAll*100).toFixed(1)+'% · '+ESC(prov)+'</div></div>'+
+      '<div class="mbar">'+bar+'</div>'+
+      '<div class="mv">'+FN(tot)+'</div></div>';
+  }).join(''):'<div class="empty">No cline models yet.</div>';
+  $('c-model-legend').innerHTML='<span><i style="background:'+c.accent+'"></i>Input</span><span><i style="background:'+c.accent2+'"></i>Output</span><span><i style="background:'+c.cache+'"></i>Cache</span><span>click a model to filter sessions</span>';
+  $('c-insights').innerHTML=(C.insights||[]).map(ins=>'<div class="in"><p>'+BOLD(ESC(ins))+'</p></div>').join('');
+  $('c-notes-hint').textContent=CRANGE==='all'?'generated from your cline data':'all-time notes · charts/tables follow the period filter';
+  const pf=$('c-provider-f'),mf=$('c-model-f');
+  pf.innerHTML='<option value="">All providers</option>'+(C.providers||[]).map(p=>'<option value="'+ESC(p[0])+'">'+ESC(p[0])+'</option>').join('');
+  mf.innerHTML='<option value="">All models</option>'+(C.models||[]).map(m=>'<option value="'+ESC(m[0])+'">'+ESC(cModelShort(m[0]))+'</option>').join('');
+  pf.value=CFSTATE.provider||'';mf.value=CFSTATE.model||'';
+  renderClineFilterBar();
+  renderClineSessions();
+  renderClineAct();
+  updateTabCounts();
+}
+function topClineModelName(){
+  if(!C||!C.models||!C.models.length)return'—';
+  return ESC(cModelShort(C.models[0][0]).slice(0,30));
+}
+/* ---- Recap tab (daily totals for YT Shorts) ---- */
+function recapDayEntry(date){
+  const oc=(S&&S.days?S.days.find(d=>d.date===date):null);
+  const rx=(R&&R.days?R.days.find(d=>d.date===date):null);
+  const cx=(C&&C.days?C.days.find(d=>d.date===date):null);
+  const ocT=oc?dayTotal(oc):0, rxT=rx?rDayTokenTotal(rx):0, cxT=cx?cDayTotal(cx):0;
+  return {oc,rx,cx,ocT,rxT,cxT,
+    total:(HARNESS.opencode?ocT:0)+(HARNESS.router?rxT:0)+(HARNESS.cline?cxT:0)};
+}
+function recapConversations(date){
+  const out=[];
+  if(HARNESS.opencode&&S&&S.sessions){
+    S.sessions.filter(s=>DS(s.time_created)===date).forEach(s=>{
+      out.push({title:s.title||'Untitled',harness:'OpenCode',model:modelShort(s.model),
+        toks:s.tokens_total||((s.tokens_input||0)+(s.tokens_output||0)+(s.tokens_reasoning||0)+(s.tokens_cache||0))});});
+  }
+  if(HARNESS.router&&R&&R.requests){
+    const byModel={};
+    R.requests.forEach(r=>{
+      let ms=Date.parse(r.at||'');if(!ms||new Date(ms).toLocaleDateString('en-CA')!==date)return;
+      const k=r.model+'|'+r.provider;
+      const a=byModel[k]||(byModel[k]={title:rModelShort(r.model),harness:'Codex',model:rModelShort(r.model),toks:0,n:0,prov:r.provider});
+      a.toks+=r.total||0;a.n+=1;});
+    Object.values(byModel).forEach(a=>{a.title=a.title+' · '+a.n+' req ('+a.prov+')';out.push(a);});
+  }
+  if(HARNESS.cline&&C&&C.sessions){
+    C.sessions.filter(s=>DS(s.time_created)===date).forEach(s=>{
+      out.push({title:(s.title||s.id||'Untitled').slice(0,80),harness:'Cline',model:cModelShort(s.model),toks:s.tokens_total||0});});
+  }
+  out.sort((a,b)=>(b.toks||0)-(a.toks||0));
+  return out.slice(0,10);
+}
+function recapProviders(date){
+  const agg={};
+  const add=(k,v)=>{if(!k)return;agg[k]=(agg[k]||0)+v;};
+  if(HARNESS.opencode&&S&&S.sessions){
+    S.sessions.filter(s=>DS(s.time_created)===date).forEach(s=>{
+      const m=(s.model||'').split('/')[0]||'opencode';
+      add(m,s.tokens_total||0);});
+  }
+  if(HARNESS.router&&R&&R.requests){
+    R.requests.forEach(r=>{
+      let ms=Date.parse(r.at||'');if(!ms||new Date(ms).toLocaleDateString('en-CA')!==date)return;
+      add(r.provider||'codex',r.total||0);});
+  }
+  if(HARNESS.cline&&C&&C.requests){
+    C.requests.forEach(r=>{
+      let ms=r.ts||Date.parse(r.at||'');if(!ms)return;
+      if(new Date(ms).toLocaleDateString('en-CA')!==date)return;
+      add(r.provider||'cline',r.total||0);});
+  }
+  return Object.entries(agg).sort((a,b)=>b[1]-a[1]).slice(0,12);
+}
+function renderRecap(){
+  const date=RECAP_DATE;
+  const e=recapDayEntry(date);
+  const today=new Date().toLocaleDateString('en-CA');
+  $('recap-date').textContent=(date===today?'TODAY · ':'')+date;
+  $('recap-big').innerHTML=FN(e.total)+' <small>tokens</small>';
+  const parts=[];
+  if(HARNESS.opencode)parts.push('OpenCode '+FN(e.ocT));
+  if(HARNESS.router)parts.push('Codex '+FN(e.rxT));
+  if(HARNESS.cline)parts.push('Cline '+FN(e.cxT));
+  $('recap-sub').textContent=parts.length?parts.join('  ·  '):'All harnesses disabled in Settings.';
+  const cards=[];
+  if(HARNESS.opencode)cards.push(['OpenCode',e.ocT,(e.oc?e.oc.sessions+' sess · '+e.oc.msgs+' msgs':'no activity')]);
+  if(HARNESS.router)cards.push(['Codex',e.rxT,(e.rx?e.rx.reqs+' req · '+e.rx.ok+' ok':'no activity')]);
+  if(HARNESS.cline)cards.push(['Cline',e.cxT,(e.cx?e.cx.reqs+' msg · '+e.cx.ok+' sess-eq':'no activity')]);
+  $('recap-split').innerHTML=cards.map(([l,v,s])=>'<div class="recap-card"><div class="rl">'+l+'</div><div class="rv">'+FN(v)+'</div><div class="rs">'+ESC(s)+'</div></div>').join('')||'<div class="empty">Enable a harness in Settings.</div>';
+  const provs=recapProviders(date);
+  $('recap-providers').innerHTML=provs.map(([k,v])=>'<span class="chip" data-tip="<b>'+ESC(k)+'</b><span class=\'trow\'><span>Tokens</span><b>'+FN(v)+'</b></span>"><b>'+FN(v)+'</b><span class="n">'+ESC(k)+'</span></span>').join('')||'<span class="empty">No provider data for this date.</span>';
+  const convs=recapConversations(date);
+  $('recap-conv-hint').textContent=convs.length?'top by tokens · '+date:'nothing recorded · '+date;
+  const tb=$('recap-tbl').querySelector('tbody');
+  tb.innerHTML=convs.map(c=>'<tr><td><div class="t" style="font-size:12.5px">'+ESC((c.title||'Untitled').slice(0,90))+'</div></td>'+
+    '<td><span class="badge agent">'+ESC(c.harness)+'</span></td><td><span class="badge model">'+ESC((c.model||'—').slice(0,32))+'</span></td>'+
+    '<td class="num" style="font-weight:700">'+FN(c.toks||0)+'</td></tr>').join('')
+    ||'<tr><td colspan="4"><div class="empty">No conversations on this date.</div></td></tr>';
+  updateTabCounts();
+}
+function recapCopyText(){
+  const date=RECAP_DATE;
+  const e=recapDayEntry(date);
+  const convs=recapConversations(date).slice(0,3);
+  const lines=[date+': '+Math.round(e.total).toLocaleString('en-US')+' tokens'];
+  const bits=[];
+  if(HARNESS.opencode)bits.push('OpenCode '+Math.round(e.ocT).toLocaleString('en-US'));
+  if(HARNESS.router)bits.push('Codex '+Math.round(e.rxT).toLocaleString('en-US'));
+  if(HARNESS.cline)bits.push('Cline '+Math.round(e.cxT).toLocaleString('en-US'));
+  if(bits.length)lines.push('('+bits.join(' · ')+')');
+  convs.forEach(c=>lines.push('— '+(c.title||'Untitled').slice(0,60)+' ('+Math.round(c.toks||0).toLocaleString('en-US')+')'));
+  return lines.join('\n');
+}
+/* ---- harness settings ---- */
+function applyHarness(){
+  const map={opencode:'tab-opencode',router:'tab-router',cline:'tab-cline'};
+  for(const k in map){const el=$(map[k]);if(el)el.style.display=HARNESS[k]?'':'none';}
+  try{
+    $('set-opencode').checked=!!HARNESS.opencode;
+    $('set-router').checked=!!HARNESS.router;
+    $('set-cline').checked=!!HARNESS.cline;
+  }catch(_){}
+  try{localStorage.setItem('ocd-harness',JSON.stringify(HARNESS));}catch(_){}
+  if(TAB==='opencode'&&!HARNESS.opencode)setTab(HARNESS.router?'router':(HARNESS.cline?'cline':'recap'));
+  else if(TAB==='router'&&!HARNESS.router)setTab(HARNESS.opencode?'opencode':(HARNESS.cline?'cline':'recap'));
+  else if(TAB==='cline'&&!HARNESS.cline)setTab(HARNESS.opencode?'opencode':(HARNESS.router?'router':'recap'));
+  updateTabCounts();
+  if(TAB==='recap')renderRecap();
+}
+function updateTabCounts(){
+  try{
+    if(S&&S.totals)$('tab-opencode-cnt').textContent=FN(S.totals.tokens_total||0);
+    if(R&&R.totals)$('tab-router-cnt').textContent=F(R.totals.requests||0)+' req';
+    if(C&&C.totals)$('tab-cline-cnt').textContent=F(C.totals.requests||0)+' msg';
+    const t=new Date().toLocaleDateString('en-CA');
+    $('tab-recap-cnt').textContent=FN(recapDayEntry(RECAP_DATE||t).total);
+  }catch(_){}
+}
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode';
-  $('tab-opencode').classList.toggle('active',oc);
-  $('tab-router').classList.toggle('active',!oc);
-  $('tab-opencode').setAttribute('aria-selected',oc);
-  $('tab-router').setAttribute('aria-selected',!oc);
-  $('view-opencode').hidden=!oc;
-  $('view-router').hidden=oc;
+  const tabs=['opencode','router','cline','recap'];
+  tabs.forEach(t=>{
+    const btn=$('tab-'+t), view=$('view-'+t);
+    const on=t===name;
+    if(btn){btn.classList.toggle('active',on);btn.setAttribute('aria-selected',on);}
+    if(view)view.hidden=!on;
+  });
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(!oc)renderRouter();else renderAll();
+  if(name==='router')renderRouter();
+  else if(name==='cline')renderCline();
+  else if(name==='recap')renderRecap();
+  else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -2695,7 +3716,7 @@ document.addEventListener('focusin',e=>{
 });
 document.addEventListener('focusout',()=>tipHide());
 document.addEventListener('click',e=>{
-  if(!e.target.closest('.export-wrap'))$('expmenu').classList.remove('open');
+  if(!e.target.closest('.export-wrap')){$('expmenu').classList.remove('open');$('setmenu').classList.remove('open');}
   const el=e.target.closest?e.target.closest('[data-f]'):null;
   if(!el)return;
   const idx=el.dataset.f.indexOf('|');
@@ -2728,6 +3749,16 @@ document.querySelectorAll('.pbtn[data-rcs]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.pbtn[data-rcs]').forEach(x=>x.classList.toggle('active',x===b));
   renderRouterCommitChart();
 });
+document.querySelectorAll('.pbtn[data-cfs]').forEach(b=>b.onclick=()=>{
+  CFS=b.dataset.cfs;CFS_EXP=false;
+  document.querySelectorAll('.pbtn[data-cfs]').forEach(x=>x.classList.toggle('active',x===b));
+  renderClineFileChart();
+});
+document.querySelectorAll('.pbtn[data-ccs]').forEach(b=>b.onclick=()=>{
+  CCS=b.dataset.ccs;CCS_EXP=false;
+  document.querySelectorAll('.pbtn[data-ccs]').forEach(x=>x.classList.toggle('active',x===b));
+  renderClineCommitChart();
+});
 document.addEventListener('click',e=>{
   const b=e.target.closest?e.target.closest('[data-exp]'):null;
   if(!b)return;
@@ -2736,6 +3767,8 @@ document.addEventListener('click',e=>{
   else if(k==='cs'){CS_EXP=!CS_EXP;renderCommitChart();}
   else if(k==='rfs'){RFS_EXP=!RFS_EXP;renderRouterFileChart();}
   else if(k==='rcs'){RCS_EXP=!RCS_EXP;renderRouterCommitChart();}
+  else if(k==='cfs'){CFS_EXP=!CFS_EXP;renderClineFileChart();}
+  else if(k==='ccs'){CCS_EXP=!CCS_EXP;renderClineCommitChart();}
 });
 document.querySelectorAll('.pbtn[data-r]').forEach(b=>b.onclick=()=>{
   RANGE=b.dataset.r;
@@ -2751,8 +3784,68 @@ document.querySelectorAll('.pbtn[data-rr]').forEach(b=>b.onclick=()=>{
 });
 $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split reasoning: '+(RSPLIT?'on':'off');$('r-split-btn').setAttribute('aria-pressed',RSPLIT);renderRouter();};
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
+document.querySelectorAll('.pbtn[data-cr]').forEach(b=>b.onclick=()=>{
+  CRANGE=b.dataset.cr;
+  document.querySelectorAll('.pbtn[data-cr]').forEach(x=>x.classList.toggle('active',x===b));
+  renderCline();
+});
+$('c-share-btn').onclick=()=>{CSHARE=!CSHARE;$('c-share-btn').textContent='Share: '+(CSHARE?'on':'off');$('c-share-btn').setAttribute('aria-pressed',CSHARE);renderCline();};
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
+$('tab-cline').onclick=()=>setTab('cline');
+$('tab-recap').onclick=()=>setTab('recap');
+$('c-search').addEventListener('input',renderClineSessions);
+$('c-provider-f').addEventListener('change',e=>{CFSTATE.provider=e.target.value||null;renderCline();});
+$('c-model-f').addEventListener('change',e=>{CFSTATE.model=e.target.value||null;renderCline();});
+document.addEventListener('click',e=>{
+  const cm=e.target.closest?e.target.closest('[data-cm]'):null;
+  if(cm){CFSTATE.model=CFSTATE.model===cm.dataset.cm?null:cm.dataset.cm;$('c-model-f').value=CFSTATE.model||'';renderCline();return;}
+  const cp=e.target.closest?e.target.closest('[data-cp]'):null;
+  if(cp){CFSTATE.provider=CFSTATE.provider===cp.dataset.cp?null:cp.dataset.cp;$('c-provider-f').value=CFSTATE.provider||'';renderCline();return;}
+  const cs=e.target.closest?e.target.closest('[data-cs]'):null;
+  if(cs){CFSTATE.session=CFSTATE.session===cs.dataset.cs?null:cs.dataset.cs;renderCline();return;}
+  const cd=e.target.closest?e.target.closest('[data-cday]'):null;
+  if(cd){CFSTATE.day=CFSTATE.day===cd.dataset.cday?null:cd.dataset.cday;renderCline();return;}
+});
+/* recap controls */
+function setRecapDate(d){
+  RECAP_DATE=d;
+  document.querySelectorAll('.pbtn[data-recap]').forEach(x=>{
+    const today=new Date().toLocaleDateString('en-CA');
+    const yest=new Date(Date.now()-86400000).toLocaleDateString('en-CA');
+    const mine=x.dataset.recap==='today'?today:x.dataset.recap==='yesterday'?yest:null;
+    x.classList.toggle('active',mine===d);
+  });
+  try{$('recap-picker').value=d;}catch(_){}
+  renderRecap();
+}
+document.querySelectorAll('.pbtn[data-recap]').forEach(b=>b.onclick=()=>{
+  const today=new Date().toLocaleDateString('en-CA');
+  setRecapDate(b.dataset.recap==='yesterday'?new Date(Date.now()-86400000).toLocaleDateString('en-CA'):today);
+});
+$('recap-picker').addEventListener('change',e=>{if(e.target.value)setRecapDate(e.target.value);});
+$('recap-copy').onclick=async()=>{
+  const txt=recapCopyText();
+  try{await navigator.clipboard.writeText(txt);toast('Recap copied — paste it into your Short.');}
+  catch(_){
+    const ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy');toast('Recap copied — paste it into your Short.');}
+    catch(__){toast('Copy failed — select the numbers manually.',false);}
+    ta.remove();
+  }
+};
+/* harness settings */
+$('settings').onclick=e=>{e.stopPropagation();$('setmenu').classList.toggle('open');};
+[['set-opencode','opencode'],['set-router','router'],['set-cline','cline']].forEach(([id,key])=>{
+  $(id).addEventListener('change',e=>{
+    if(!e.target.checked){
+      const on=Object.keys(HARNESS).filter(k=>k===key?false:HARNESS[k]);
+      if(!on.length){e.target.checked=true;toast('Keep at least one harness enabled.',false);return;}
+    }
+    HARNESS[key]=e.target.checked;
+    applyHarness();
+  });
+});
 $('r-search').addEventListener('input',renderRouterRequests);
 $('r-status-f').addEventListener('change',e=>{RFSTATE.status=e.target.value||'';renderRouter();});
 $('r-provider-f').addEventListener('change',e=>{RFSTATE.provider=e.target.value||null;renderRouter();});
@@ -2778,15 +3871,28 @@ document.querySelectorAll('#tbl th').forEach(th=>{th.onclick=sortH;th.tabIndex=0
 /* export */
 function exportData(kind){
   const isR=TAB==='router'&&R;
+  const isC=TAB==='cline'&&C;
   if(kind==='json'){
-    const b=new Blob([JSON.stringify(isR?R:S,null,2)],{type:'application/json'});
-    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
+    const b=new Blob([JSON.stringify(isR?R:(isC?C:S),null,2)],{type:'application/json'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':(isC?'cline-tokens.json':'opencode-tokens.json');a.click();
+  }else if(kind==='recap'){
+    const dates=[...new Set([...(S.days||[]).map(d=>d.date),...(R.days||[]).map(d=>d.date),...(C.days||[]).map(d=>d.date)])].sort();
+    const head=['date','opencode_tokens','codex_tokens','cline_tokens','total_tokens'];
+    const lines=[head.join(',')].concat(dates.map(d=>{const e=recapDayEntry(d);return [d,Math.round(e.ocT),Math.round(e.rxT),Math.round(e.cxT),Math.round(e.total)].join(',');}));
+    const b=new Blob([lines.join('\n')],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='recap-tokens-days.csv';a.click();
   }else if(isR){
     const rows=rPeriodDays();
     const head=['date','requests','ok','errors','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];
     const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,d.err,Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(rDayTokenTotal(d)),(d.what_if||0)].join(',')));
     const b=new Blob([lines.join('\n')],{type:'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='codex-tokens-days.csv';a.click();
+  }else if(isC){
+    const rows=cPeriodDays();
+    const head=['date','messages','sessions','tokens_in','tokens_out','tokens_cache','tokens_total'];
+    const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(cDayTotal(d))].join(',')));
+    const b=new Blob([lines.join('\n')],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='cline-tokens-days.csv';a.click();
   }else{
     const rows=periodDays();
     const head=['date','messages','sessions','tokens_in','tokens_out','tokens_reasoning','tokens_cache','tokens_total'];
@@ -2821,13 +3927,16 @@ let loading=false;
 async function load(){
   if(loading)return;loading=true;$('refresh').disabled=true;
   try{
-    const [r1,r2]=await Promise.all([
+    const [r1,r2,r3]=await Promise.all([
       fetch('/api/stats?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
       fetch('/api/router?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
+      fetch('/api/cline?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
     ]);
     if(!r1.ok)throw new Error('HTTP '+r1.status);
     S=await r1.json();renderAll();
     try{if(r2.ok){R=await r2.json();if(TAB==='router')renderRouter();else renderRouter();}}catch(_){}
+    try{if(r3.ok){C=await r3.json();if(TAB==='cline')renderCline();else if(C)renderCline();}}catch(_){}
+    if(TAB==='recap')renderRecap();else updateTabCounts();
     $('status').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   }catch(e){$('status').textContent='Failed: '+e.message;}
   finally{loading=false;$('refresh').disabled=false;}
@@ -2836,9 +3945,17 @@ $('refresh').onclick=load;
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
 setInterval(()=>{if(!document.hidden)load();},30000);
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'){setTab('router');}}catch(_){}
+applyHarness();
+try{
+  const saved=sessionStorage.getItem('ocd-tab');
+  if(saved==='router'||saved==='cline'||saved==='recap')setTab(saved);
+  else if(!HARNESS.opencode)setTab(HARNESS.router?'router':(HARNESS.cline?'cline':'recap'));
+}catch(_){}
+try{$('recap-picker').value=RECAP_DATE;}catch(_){}
 if(S){renderAll();$('status').textContent='Updated just now';}
 if(R){renderRouter();}
+if(C){renderCline();}
+renderRecap();
 load();
 </script>
 </body>
@@ -2855,6 +3972,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path = None
     router_events = None
     router_limits = None
+    cline_dir = None
     server = None
     quiet = False
 
@@ -2928,7 +4046,12 @@ class Handler(BaseHTTPRequestHandler):
                     db_worktrees(self.db_path)))
             except Exception as e:
                 router_payload = json_html(blank_router_stats(error=str(e)))
-            body = PAGE.replace("__DATA__", payload).replace("__ROUTER__", router_payload).encode("utf-8")
+            try:
+                cline_payload = json_html(cached_cline_stats(
+                    self.cline_dir, db_worktrees(self.db_path)))
+            except Exception as e:
+                cline_payload = json_html(blank_cline_stats(error=str(e)))
+            body = PAGE.replace("__DATA__", payload).replace("__ROUTER__", router_payload).replace("__CLINE__", cline_payload).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
         elif path.startswith("/api/session/"):
             session_id = path[len("/api/session/"):]
@@ -2957,6 +4080,14 @@ class Handler(BaseHTTPRequestHandler):
                                               db_worktrees(self.db_path))
             except Exception as e:
                 stats = blank_router_stats(error=str(e))
+            body = json.dumps(stats).encode("utf-8")
+            self._send(200, "application/json", body)
+        elif path.startswith("/api/cline"):
+            try:
+                stats = cached_cline_stats(self.cline_dir,
+                                           db_worktrees(self.db_path))
+            except Exception as e:
+                stats = blank_cline_stats(error=str(e))
             body = json.dumps(stats).encode("utf-8")
             self._send(200, "application/json", body)
         else:
@@ -3034,11 +4165,14 @@ def main():
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
                         help="path to Codex Router rate-limits.json")
+    parser.add_argument("--cline-dir", default=str(CLINE_DIR_DEFAULT),
+                        help="path to Cline Desktop data dir (sessions + db)")
     args = parser.parse_args()
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
+    Handler.cline_dir = args.cline_dir
     Handler.quiet = args.quiet
 
     try:

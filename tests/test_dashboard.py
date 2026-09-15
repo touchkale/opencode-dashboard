@@ -66,6 +66,7 @@ def reset_caches():
     with d.LOCK:
         d.LOCAL_CACHE.clear()
         d.ROUTER_CACHE.clear()
+        d.CLINE_CACHE.clear()
     yield
 
 
@@ -615,3 +616,115 @@ def test_router_commits_time_matched(tmp_path, monkeypatch):
     assert row[7] == pytest.approx(1100 + 2300 + 550)
     assert row[8] == 3
     assert "hour_tokens" not in stats
+
+
+def seed_cline_dir(base, day="2026-09-04"):
+    """Create a minimal Cline Desktop data dir: sessions.db + one session."""
+    import time as _time
+    base = str(base)
+    os.makedirs(os.path.join(base, "sessions", "sess1"), exist_ok=True)
+    os.makedirs(os.path.join(base, "db"), exist_ok=True)
+    dbp = os.path.join(base, "db", "sessions.db")
+    con = sqlite3.connect(dbp)
+    con.execute(
+        "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, source TEXT, pid INTEGER,"
+        " started_at TEXT, ended_at TEXT, exit_code INTEGER, status TEXT, status_lock INTEGER,"
+        " interactive INTEGER, provider TEXT, model TEXT, cwd TEXT, workspace_root TEXT,"
+        " team_name TEXT, enable_tools INTEGER, enable_spawn INTEGER, enable_teams INTEGER,"
+        " parent_session_id TEXT, parent_agent_id TEXT, agent_id TEXT, conversation_id TEXT,"
+        " is_subagent INTEGER, prompt TEXT, metadata_json TEXT, transcript_path TEXT,"
+        " hook_path TEXT, messages_path TEXT, updated_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sess1", "desktop", 1, day + "T10:00:00.000Z", None, None, "running", 0,
+         1, "cline", "cline-free/deepseek-v4.1-flash", "/work/demo", "/work/demo",
+         None, 1, 1, 1, None, None, None, None, 0, "Fix bug", "{}", "", "", "", day + "T10:00:00.000Z"),
+    )
+    con.commit()
+    con.close()
+    ts = int(datetime(2026, 9, 4, 10, 0).timestamp() * 1000)
+    msgs = {"version": 1, "sessionId": "sess1", "messages": [
+        {"id": "u1", "role": "user", "content": [], "ts": ts},
+        {"id": "a1", "role": "assistant", "content": [], "ts": ts + 1000,
+         "modelInfo": {"id": "cline-free/deepseek-v4.1-flash", "provider": "cline"},
+         "metrics": {"inputTokens": 1000, "outputTokens": 100,
+                     "cacheReadTokens": 200, "cacheWriteTokens": 50}},
+        {"id": "a2", "role": "assistant", "content": [], "ts": ts + 2000,
+         "modelInfo": {"id": "cline-free/deepseek-v4.1-flash", "provider": "cline"},
+         "metrics": {"inputTokens": 2000, "outputTokens": 300,
+                     "cacheReadTokens": 500, "cacheWriteTokens": 0}},
+        {"id": "a3", "role": "assistant", "content": [], "ts": ts + 3000,
+         "modelInfo": {"id": "cline-free/deepseek-v4.1-flash", "provider": "cline"}},
+    ]}
+    with open(os.path.join(base, "sessions", "sess1", "sess1.messages.json"), "w") as f:
+        json.dump(msgs, f)
+    return base
+
+
+def test_cline_totals_and_cache(tmp_path):
+    cline = seed_cline_dir(tmp_path / "cline")
+    stats = d.query_cline_stats(cline)
+    t = stats["totals"]
+    assert t["requests"] == 2  # unmetered a3 excluded
+    assert t["unmetered"] == 1
+    assert t["tokens_input"] == pytest.approx(3000)
+    assert t["tokens_output"] == pytest.approx(400)
+    assert t["tokens_cache_read"] == pytest.approx(750)  # read+write combined
+    assert t["tokens_total"] == pytest.approx(4150)
+    assert t["sessions"] == 1
+    assert stats["days"][0]["total"] == pytest.approx(4150)
+
+
+def test_cline_models_providers_sessions(tmp_path):
+    cline = seed_cline_dir(tmp_path / "cline")
+    stats = d.query_cline_stats(cline)
+    assert len(stats["models"]) == 1
+    row = stats["models"][0]
+    assert row[0] == "cline-free/deepseek-v4.1-flash"
+    assert row[1] == 2 and row[2] == pytest.approx(4150)
+    assert stats["providers"][0][0] == "cline"
+    assert len(stats["sessions"]) == 1
+    s = stats["sessions"][0]
+    assert s["id"] == "sess1" and s["tokens_total"] == pytest.approx(4150)
+    assert s["msgs"] == 2
+
+
+def test_blank_cline_stats_shape():
+    stats = d.blank_cline_stats(error="x")
+    assert stats["source"] == "cline"
+    assert stats["totals"]["tokens_total"] == 0
+    assert stats["activity"] and len(stats["activity"]) == d.ACTIVITY_DAYS
+    assert stats["records"]["streaks"] == {"current": 0, "longest": 0}
+    assert stats["error"] == "x"
+
+
+def test_cached_cline_stats_invalidates(tmp_path):
+    cline = seed_cline_dir(tmp_path / "cline")
+    with d.LOCK:
+        d.CLINE_CACHE.clear()
+    try:
+        s1 = d.cached_cline_stats(cline)
+        assert s1["totals"]["requests"] == 2
+        # append another metered message -> fingerprint (newest mtime/size) changes
+        import time
+        time.sleep(0.02)
+        p = os.path.join(cline, "sessions", "sess1", "sess1.messages.json")
+        data = json.load(open(p))
+        ts = int(datetime(2026, 9, 4, 11, 0).timestamp() * 1000)
+        data["messages"].append(
+            {"id": "a4", "role": "assistant", "content": [], "ts": ts,
+             "modelInfo": {"id": "cline-free/deepseek-v4.1-flash", "provider": "cline"},
+             "metrics": {"inputTokens": 500, "outputTokens": 50,
+                         "cacheReadTokens": 0, "cacheWriteTokens": 0}})
+        json.dump(data, open(p, "w"))
+        s2 = d.cached_cline_stats(cline)
+        assert s2["totals"]["requests"] == 3
+    finally:
+        with d.LOCK:
+            d.CLINE_CACHE.clear()
+
+
+def test_cline_missing_dir_raises(tmp_path):
+    with pytest.raises(RuntimeError):
+        d.query_cline_stats(str(tmp_path / "nope"))
