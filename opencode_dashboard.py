@@ -4474,6 +4474,265 @@ def _idle_monitor(server, idle_timeout):
             return
 
 
+def _fmt(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if abs(n) >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if abs(n) >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if abs(n) >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return f"{n:,.0f}"
+
+
+def _safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    try:
+        win.addstr(y, x, str(text)[: max(0, w - x - 1)], attr)
+    except curses.error:
+        pass
+
+
+def run_tui(args):
+    import curses
+    import webbrowser
+
+    Handler.db_path = args.db
+    Handler.router_events = args.router_events
+    Handler.router_limits = args.router_limits
+    Handler.cline_dir = args.cline_dir
+    Handler.quiet = True
+
+    # Background web server so the traditional Chrome UI can be opened on demand.
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    Handler.server = server
+    url = f"http://127.0.0.1:{args.port}"
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+
+    state = {"tab": 0, "S": None, "R": None, "C": None, "msg": "", "last": 0.0}
+    tabs = ["OpenCode", "Codex", "Cline", "Recap"]
+
+    def load_data():
+        state["msg"] = "Loading..."
+        wt = db_worktrees(args.db)
+        try:
+            state["S"] = cached_local_stats(args.db)
+        except Exception as e:
+            state["S"] = None
+            state["msg"] = f"OpenCode error: {e}"
+        try:
+            state["R"] = cached_router_stats(args.router_events, args.router_limits, wt)
+        except Exception:
+            state["R"] = None
+        try:
+            state["C"] = cached_cline_stats(args.cline_dir, wt)
+        except Exception:
+            state["C"] = None
+        state["last"] = time.time()
+        state["msg"] = "Ready  (r refresh, o open Chrome UI, q quit)"
+
+    def draw(stdscr):
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        # colors
+        if not getattr(draw, "_init", False):
+            try:
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+                curses.init_pair(2, curses.COLOR_CYAN, -1)
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)
+                curses.init_pair(4, curses.COLOR_GREEN, -1)
+                curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+            except Exception:
+                pass
+            draw._init = True
+        H1 = curses.color_pair(1) | curses.A_BOLD
+        ACC = curses.color_pair(2) | curses.A_BOLD
+        WARN = curses.color_pair(3) | curses.A_BOLD
+        GOOD = curses.color_pair(4) | curses.A_BOLD
+        MAG = curses.color_pair(5) | curses.A_BOLD
+        DIM = curses.A_DIM
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        title = "  OpenCode Dashboard TUI"
+        _safe_addstr(stdscr, 0, 0, title.ljust(w - 1), H1)
+        _safe_addstr(stdscr, 0, max(1, w - len(now) - 2), now, H1)
+
+        # tab bar
+        x = 2
+        for i, t in enumerate(tabs):
+            label = f" {t} "
+            attr = ACC if i == state["tab"] else DIM
+            _safe_addstr(stdscr, 2, x, label, attr)
+            x += len(label) + 1
+
+        # separator
+        _safe_addstr(stdscr, 3, 0, "─" * (w - 1), DIM)
+
+        y = 5
+        S = state["S"]
+        R = state["R"]
+        C = state["C"]
+
+        def kpi(label, value, col=0):
+            nonlocal y
+            _safe_addstr(stdscr, y, 2, f"{label:<26}", DIM)
+            _safe_addstr(stdscr, y, 30, str(value), curses.A_BOLD)
+            y += 1
+
+        if state["tab"] == 0:  # OpenCode
+            _safe_addstr(stdscr, y, 2, "OpenCode (local)", ACC); y += 2
+            if not S:
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No data", WARN); y += 2
+            else:
+                t = S.get("totals", {})
+                kpi("Sessions", _fmt(t.get("sessions", 0)))
+                kpi("Messages", _fmt(t.get("messages", 0)))
+                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
+                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
+                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
+                kpi("Tokens (reasoning)", _fmt(t.get("tokens_reasoning", 0)))
+                kpi("Tokens (cache)", _fmt(t.get("tokens_cache_read", 0) + t.get("tokens_cache_write", 0)))
+                kpi("Cost (USD)", f"${t.get('cost', 0):.2f}")
+                kpi("Cache rate", f"{t.get('cache_rate', 0):.1f}%")
+                y += 1
+                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
+                for m in (S.get("models") or [])[:8]:
+                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
+                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
+                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
+                    y += 1
+                    if y >= h - 4:
+                        break
+                y += 1
+                _safe_addstr(stdscr, y, 2, "Recent days", ACC); y += 1
+                for d_ in (S.get("days") or [])[-7:]:
+                    _safe_addstr(stdscr, y, 4, f"{d_.get('date')}  msgs={d_.get('msgs', 0):<5} tokens={_fmt(d_.get('total', 0))}", 0)
+                    y += 1
+                    if y >= h - 4:
+                        break
+
+        elif state["tab"] == 1:  # Codex/router
+            _safe_addstr(stdscr, y, 2, "Codex Router", ACC); y += 2
+            if not R:
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No router data", WARN); y += 2
+            else:
+                t = R.get("totals", {})
+                kpi("Requests", _fmt(t.get("requests", 0)))
+                kpi("OK", _fmt(t.get("ok", 0)))
+                kpi("Errors", _fmt(t.get("errors", 0)))
+                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
+                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
+                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
+                kpi("What-if cost", f"${t.get('what_if_cost', 0):.2f}")
+                y += 1
+                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
+                for m in (R.get("models") or [])[:8]:
+                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
+                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
+                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
+                    y += 1
+                    if y >= h - 4:
+                        break
+
+        elif state["tab"] == 2:  # Cline
+            _safe_addstr(stdscr, y, 2, "Cline Desktop", ACC); y += 2
+            if not C:
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No cline data", WARN); y += 2
+            else:
+                t = C.get("totals", {})
+                kpi("Requests", _fmt(t.get("requests", 0)))
+                kpi("Sessions", _fmt(t.get("sessions", 0)))
+                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
+                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
+                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
+                kpi("Tokens (cache)", _fmt(t.get("tokens_cache_read", 0) + t.get("tokens_cache_write", 0)))
+                y += 1
+                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
+                for m in (C.get("models") or [])[:8]:
+                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
+                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
+                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
+                    y += 1
+                    if y >= h - 4:
+                        break
+
+        else:  # Recap
+            _safe_addstr(stdscr, y, 2, "Recap (all harnesses)", ACC); y += 2
+            oc = (S.get("totals", {}).get("tokens_total", 0) if S else 0)
+            rx = (R.get("totals", {}).get("tokens_total", 0) if R else 0)
+            cx = (C.get("totals", {}).get("tokens_total", 0) if C else 0)
+            total = oc + rx + cx
+            _safe_addstr(stdscr, y, 2, f"TOTAL TOKENS: {_fmt(total)}", MAG); y += 2
+            kpi("OpenCode", _fmt(oc))
+            kpi("Codex", _fmt(rx))
+            kpi("Cline", _fmt(cx))
+            y += 1
+            _safe_addstr(stdscr, y, 2, "Open traditional Chrome UI for full charts: press 'o'", DIM); y += 1
+
+        # footer
+        foot = " q quit | r refresh | 1-4 tabs | o open Chrome UI | arrows/tab switch "
+        _safe_addstr(stdscr, h - 2, 0, "─" * (w - 1), DIM)
+        _safe_addstr(stdscr, h - 1, 0, foot[: w - 1], DIM)
+        _safe_addstr(stdscr, h - 1, max(0, w - len(state["msg"]) - 1), state["msg"][: w - 1], GOOD)
+
+        stdscr.refresh()
+
+    def main_loop(stdscr):
+        curses.curs_set(0)
+        stdscr.timeout(200)
+        load_data()
+        while True:
+            draw(stdscr)
+            try:
+                key = stdscr.getch()
+            except Exception:
+                key = -1
+            if key == -1:
+                if time.time() - state["last"] > 30:
+                    load_data()
+                continue
+            if key in (ord("q"), ord("Q")):
+                break
+            if key in (ord("r"), ord("R")):
+                with LOCK:
+                    LOCAL_CACHE.clear()
+                    ROUTER_CACHE.clear()
+                    CLINE_CACHE.clear()
+                load_data()
+            elif key in (ord("o"), ord("O"), ord("w"), ord("W")):
+                try:
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        webbrowser.open(url)
+                    state["msg"] = f"Opened {url}"
+                except Exception as e:
+                    state["msg"] = f"Open failed: {e}"
+            elif key in (9, curses.KEY_RIGHT):
+                state["tab"] = (state["tab"] + 1) % len(tabs)
+            elif key == curses.KEY_LEFT:
+                state["tab"] = (state["tab"] - 1) % len(tabs)
+            elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+                state["tab"] = key - ord("1")
+
+    try:
+        curses.wrapper(main_loop)
+    finally:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="OpenCode usage dashboard")
     parser.add_argument("db", nargs="?", default=str(DB_PATH), help="path to opencode.db")
@@ -4483,6 +4742,7 @@ def main():
         help="shut the server down after this many seconds with no requests (0 = off)",
     )
     parser.add_argument("--quiet", action="store_true", help="suppress per-request logging")
+    parser.add_argument("--tui", action="store_true", help="run the beautiful terminal UI (default web server otherwise)")
     parser.add_argument("--router-events", default=str(ROUTER_EVENTS_DEFAULT),
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
@@ -4491,6 +4751,9 @@ def main():
                         help="path to Cline Desktop data dir (sessions + db)")
     args = parser.parse_args()
 
+    if args.tui:
+        run_tui(args)
+        return
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
