@@ -56,6 +56,32 @@ def connect(db_path):
     return con
 
 
+def _tables(con):
+    try:
+        return {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.Error:
+        return set()
+
+
+def session_table(con):
+    tabs = _tables(con)
+    if "session_v2" in tabs:
+        return "session_v2"
+    return "session"
+
+
+def message_table(con):
+    tabs = _tables(con)
+    if "session_message" in tabs:
+        return "session_message"
+    return "message"
+
+
+def has_table(con, name):
+    return name in _tables(con)
+
+
 def json_html(obj):
     """Serialize for safe embedding inside <script>const S0 = ...;</script>.
 
@@ -328,19 +354,21 @@ def collect_repo_commits(worktrees, per_repo=MAX_COMMITS_PER_REPO):
 
 
 def query_stats(con):
+    ST = session_table(con)
+    MT = message_table(con)
     totals = dict(
         con.execute(
-            """
-            SELECT (SELECT COUNT(*) FROM session) AS sessions,
-                   (SELECT COUNT(*) FROM message) AS messages,
-                   (SELECT COALESCE(SUM(tokens_input),0) FROM session) AS tokens_input,
-                   (SELECT COALESCE(SUM(tokens_output),0) FROM session) AS tokens_output,
-                   (SELECT COALESCE(SUM(tokens_reasoning),0) FROM session) AS tokens_reasoning,
-                   (SELECT COALESCE(SUM(tokens_cache_read),0) FROM session) AS tokens_cache_read,
-                   (SELECT COALESCE(SUM(tokens_cache_write),0) FROM session) AS tokens_cache_write,
-                   (SELECT COALESCE(SUM(cost),0) FROM session) AS cost,
+            f"""
+            SELECT (SELECT COUNT(*) FROM {ST}) AS sessions,
+                   (SELECT COUNT(*) FROM {MT}) AS messages,
+                   (SELECT COALESCE(SUM(tokens_input),0) FROM {ST}) AS tokens_input,
+                   (SELECT COALESCE(SUM(tokens_output),0) FROM {ST}) AS tokens_output,
+                   (SELECT COALESCE(SUM(tokens_reasoning),0) FROM {ST}) AS tokens_reasoning,
+                   (SELECT COALESCE(SUM(tokens_cache_read),0) FROM {ST}) AS tokens_cache_read,
+                   (SELECT COALESCE(SUM(tokens_cache_write),0) FROM {ST}) AS tokens_cache_write,
+                   (SELECT COALESCE(SUM(cost),0) FROM {ST}) AS cost,
                    (SELECT COALESCE(AVG((time_updated-time_created)/60000.0),0)
-                      FROM session WHERE time_created>0 AND time_updated>time_created) AS avg_duration_min
+                      FROM {ST} WHERE time_created>0 AND time_updated>time_created) AS avg_duration_min
             """
         ).fetchone()
     )
@@ -386,11 +414,11 @@ def query_stats(con):
     day_msgs = defaultdict(int)
     hours = defaultdict(int)
     for r in con.execute(
-        """
+        f"""
         SELECT date(time_created/1000,'unixepoch','localtime') AS d,
                CAST(strftime('%H',time_created/1000,'unixepoch','localtime') AS INTEGER) AS h,
                COUNT(*) AS c
-        FROM message GROUP BY d,h
+        FROM {MT} GROUP BY d,h
         """
     ):
         day_msgs[r["d"]] += r["c"]
@@ -398,13 +426,13 @@ def query_stats(con):
 
     day_sessions = defaultdict(int)
     for r in con.execute(
-        "SELECT date(time_created/1000,'unixepoch','localtime') AS d, COUNT(*) AS c FROM session GROUP BY d"
+        f"SELECT date(time_created/1000,'unixepoch','localtime') AS d, COUNT(*) AS c FROM {ST} GROUP BY d"
     ):
         day_sessions[r["d"]] = r["c"]
 
     agents = defaultdict(lambda: {"n": 0, "toks": 0})
     for r in con.execute(
-        "SELECT agent, COUNT(*) AS n, COALESCE(SUM(tokens_input)+SUM(tokens_output)+SUM(tokens_reasoning)+SUM(tokens_cache_read)+SUM(tokens_cache_write),0) AS t FROM session GROUP BY agent"
+        f"SELECT agent, COUNT(*) AS n, COALESCE(SUM(tokens_input)+SUM(tokens_output)+SUM(tokens_reasoning)+SUM(tokens_cache_read)+SUM(tokens_cache_write),0) AS t FROM {ST} GROUP BY agent"
     ):
         a = r["agent"] or "default"
         agents[a]["n"] += r["n"]
@@ -412,14 +440,14 @@ def query_stats(con):
 
     models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0})
     for r in con.execute(
-        """
+        f"""
         SELECT model, COUNT(*) AS n,
                 COALESCE(SUM(tokens_input),0) AS ti,
                 COALESCE(SUM(tokens_output),0) AS to_,
                 COALESCE(SUM(tokens_reasoning),0) AS tr,
                 COALESCE(SUM(tokens_cache_read),0)+COALESCE(SUM(tokens_cache_write),0) AS ca,
                 COALESCE(SUM(cost),0) AS cost
-        FROM session GROUP BY model
+        FROM {ST} GROUP BY model
         """
     ):
         m = parse_model(r["model"])
@@ -434,13 +462,13 @@ def query_stats(con):
     # endpoint fetches prompts on demand.
     sessions = []
     for r in con.execute(
-        """
+        f"""
         SELECT s.id, s.title, s.agent, s.model, s.time_created, s.time_updated,
                 s.tokens_input, s.tokens_output, s.tokens_reasoning,
                 COALESCE(s.tokens_cache_read,0)+COALESCE(s.tokens_cache_write,0) AS cache_read, s.cost,
                p.worktree,
-               (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msgs
-        FROM session s LEFT JOIN project p ON p.id = s.project_id
+               (SELECT COUNT(*) FROM {MT} m WHERE m.session_id = s.id) AS msgs
+        FROM {ST} s LEFT JOIN project p ON p.id = s.project_id
         ORDER BY s.time_created DESC LIMIT ?
         """,
         (MAX_SESSION_ROWS,),
@@ -475,9 +503,9 @@ def query_stats(con):
     projects = defaultdict(lambda: {"n": 0, "toks": 0})
     pid_info = {}
     for r in con.execute(
-        """SELECT p.id, p.name, p.worktree, COUNT(s.id) AS n,
+        f"""SELECT p.id, p.name, p.worktree, COUNT(s.id) AS n,
                    COALESCE(SUM(s.tokens_input)+SUM(s.tokens_output)+SUM(s.tokens_reasoning)+SUM(s.tokens_cache_read)+SUM(s.tokens_cache_write),0) AS t
-            FROM project p LEFT JOIN session s ON s.project_id=p.id GROUP BY p.id"""
+            FROM project p LEFT JOIN {ST} s ON s.project_id=p.id GROUP BY p.id"""
     ):
         key = r["name"] or short_dir(r["worktree"])
         pid_info[r["id"]] = (key, r["worktree"])
@@ -489,11 +517,11 @@ def query_stats(con):
     # Full-table session map (not capped) for token attribution.
     sess_all = {}
     for r in con.execute(
-        """SELECT id, project_id, time_updated,
+        f"""SELECT id, project_id, time_updated,
                   COALESCE(tokens_input,0)+COALESCE(tokens_output,0)
                    +COALESCE(tokens_reasoning,0)+COALESCE(tokens_cache_read,0)
                    +COALESCE(tokens_cache_write,0) AS tot
-           FROM session"""
+           FROM {ST}"""
     ):
         nm, wt = pid_info.get(r["project_id"], ("—", ""))
         sess_all[r["id"]] = (r["tot"] or 0, r["time_updated"] or 0, nm, wt)
@@ -603,12 +631,12 @@ def query_stats(con):
     # bests accurately.
     biggest_day = max(day_entries, key=lambda d: d["total"]) if day_entries else None
     biggest_row = con.execute(
-        """
+        f"""
         SELECT title, model,
                COALESCE(tokens_input,0)+COALESCE(tokens_output,0)
                  +COALESCE(tokens_reasoning,0)+COALESCE(tokens_cache_read,0)
                  +COALESCE(tokens_cache_write,0) AS tot
-        FROM session ORDER BY tot DESC LIMIT 1
+        FROM {ST} ORDER BY tot DESC LIMIT 1
         """
     ).fetchone()
     biggest_session = (
@@ -617,13 +645,13 @@ def query_stats(con):
         if biggest_row else None
     )
     fastest_row = con.execute(
-        """
+        f"""
         SELECT title,
                (COALESCE(tokens_input,0)+COALESCE(tokens_output,0)
                  +COALESCE(tokens_reasoning,0)+COALESCE(tokens_cache_read,0)
                  +COALESCE(tokens_cache_write,0)) AS tot,
                (time_updated-time_created)/60000.0 AS mins
-        FROM session
+        FROM {ST}
         WHERE time_created>0 AND time_updated>time_created
           AND (time_updated-time_created)/60000.0 >= 0.5
         ORDER BY tot/((time_updated-time_created)/60000.0) DESC LIMIT 1
@@ -639,8 +667,8 @@ def query_stats(con):
     top_model = sorted(models.items(), key=lambda kv: -(kv[1]["ti"] + kv[1]["to"] + kv[1]["tr"] + kv[1]["cache"]))[0] if models else None
     top_agent = sorted(agents.items(), key=lambda kv: -kv[1]["n"])[0] if agents else ("—", {"n": 0})
     longest = con.execute(
-        """
-        SELECT title, (time_updated-time_created)/60000.0 AS mins FROM session
+        f"""
+        SELECT title, (time_updated-time_created)/60000.0 AS mins FROM {ST}
         WHERE time_created>0 AND time_updated>time_created
         ORDER BY (time_updated-time_created) DESC LIMIT 1
         """
@@ -795,6 +823,268 @@ def _fingerprint_paths(paths):
     return tuple(fps)
 
 
+def ledger_path_for(db_path):
+    p = Path(db_path)
+    return p.with_name(p.name + ".usage-ledger.sqlite")
+
+
+def ledger_connect(db_path):
+    lp = ledger_path_for(db_path)
+    con = sqlite3.connect(str(lp))
+    con.row_factory = sqlite3.Row
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_usage (
+            session_id TEXT PRIMARY KEY,
+            title TEXT,
+            agent TEXT,
+            model TEXT,
+            project_id TEXT,
+            project_name TEXT,
+            worktree TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            tokens_input INTEGER DEFAULT 0,
+            tokens_output INTEGER DEFAULT 0,
+            tokens_reasoning INTEGER DEFAULT 0,
+            tokens_cache_read INTEGER DEFAULT 0,
+            tokens_cache_write INTEGER DEFAULT 0,
+            cost REAL DEFAULT 0,
+            msgs INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0,
+            last_seen INTEGER
+        )
+        """
+    )
+    con.commit()
+    return con
+
+
+def sync_session_ledger(db_path, con):
+    """Upsert every session currently in the OpenCode DB into the persistent
+    ledger. Sessions that disappear from the source DB are retained (marked
+    deleted) so their tokens are never lost."""
+    try:
+        lcon = ledger_connect(db_path)
+    except Exception:
+        return
+    try:
+        ST = session_table(con)
+        MT = message_table(con)
+        pid_info = {}
+        try:
+            for r in con.execute("SELECT id, name, worktree FROM project"):
+                pid_info[r["id"]] = (r["name"] or short_dir(r["worktree"]), r["worktree"])
+        except sqlite3.Error:
+            pass
+        msgs = {}
+        try:
+            for r in con.execute(
+                f"SELECT session_id, COUNT(*) AS c FROM {MT} GROUP BY session_id"
+            ):
+                msgs[r["session_id"]] = r["c"]
+        except sqlite3.Error:
+            pass
+        rows = con.execute(
+            f"""SELECT id, title, agent, model, project_id, time_created, time_updated,
+                       tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
+                       tokens_cache_write, cost FROM {ST}"""
+        ).fetchall()
+        now = int(time.time() * 1000)
+        cur_ids = []
+        for r in rows:
+            sid = r["id"]
+            cur_ids.append(sid)
+            nm, wt = pid_info.get(r["project_id"], ("—", ""))
+            lcon.execute(
+                """
+                INSERT INTO session_usage (
+                    session_id, title, agent, model, project_id, project_name, worktree,
+                    time_created, time_updated, tokens_input, tokens_output, tokens_reasoning,
+                    tokens_cache_read, tokens_cache_write, cost, msgs, deleted, last_seen)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    title=excluded.title, agent=excluded.agent, model=excluded.model,
+                    project_id=excluded.project_id, project_name=excluded.project_name,
+                    worktree=excluded.worktree, time_created=excluded.time_created,
+                    time_updated=excluded.time_updated, tokens_input=excluded.tokens_input,
+                    tokens_output=excluded.tokens_output, tokens_reasoning=excluded.tokens_reasoning,
+                    tokens_cache_read=excluded.tokens_cache_read,
+                    tokens_cache_write=excluded.tokens_cache_write, cost=excluded.cost,
+                    msgs=excluded.msgs, deleted=0, last_seen=excluded.last_seen
+                """,
+                (
+                    sid, r["title"], r["agent"], r["model"], r["project_id"], nm, wt,
+                    r["time_created"], r["time_updated"], r["tokens_input"] or 0,
+                    r["tokens_output"] or 0, r["tokens_reasoning"] or 0,
+                    r["tokens_cache_read"] or 0, r["tokens_cache_write"] or 0,
+                    r["cost"] or 0, msgs.get(sid, 0), now,
+                ),
+            )
+        if cur_ids:
+            placeholders = ",".join("?" for _ in cur_ids)
+            lcon.execute(
+                f"UPDATE session_usage SET deleted=1 WHERE session_id NOT IN ({placeholders})",
+                cur_ids,
+            )
+        lcon.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            lcon.close()
+        except Exception:
+            pass
+
+
+def ledger_totals(db_path):
+    try:
+        lcon = ledger_connect(db_path)
+    except Exception:
+        return None
+    try:
+        row = lcon.execute(
+            """
+            SELECT COUNT(*) AS sessions,
+                   COALESCE(SUM(msgs),0) AS messages,
+                   COALESCE(SUM(tokens_input),0) AS ti,
+                   COALESCE(SUM(tokens_output),0) AS to_,
+                   COALESCE(SUM(tokens_reasoning),0) AS tr,
+                   COALESCE(SUM(tokens_cache_read),0) AS cr,
+                   COALESCE(SUM(tokens_cache_write),0) AS cw,
+                   COALESCE(SUM(cost),0) AS cost
+            FROM session_usage
+            """
+        ).fetchone()
+        return {
+            "sessions": row["sessions"] or 0,
+            "messages": row["messages"] or 0,
+            "ti": row["ti"] or 0,
+            "to": row["to_"] or 0,
+            "tr": row["tr"] or 0,
+            "cr": row["cr"] or 0,
+            "cw": row["cw"] or 0,
+            "cost": row["cost"] or 0,
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            lcon.close()
+        except Exception:
+            pass
+
+
+def ledger_day_tokens(db_path):
+    out = {}
+    try:
+        lcon = ledger_connect(db_path)
+    except Exception:
+        return out
+    try:
+        for r in lcon.execute(
+            """SELECT time_created, tokens_input, tokens_output, tokens_reasoning,
+                      tokens_cache_read, tokens_cache_write, cost
+               FROM session_usage"""
+        ):
+            ms = r["time_created"] or 0
+            day = _day(ms)
+            if not day:
+                continue
+            ti = r["tokens_input"] or 0
+            to = r["tokens_output"] or 0
+            tr = r["tokens_reasoning"] or 0
+            cr = r["tokens_cache_read"] or 0
+            cw = r["tokens_cache_write"] or 0
+            cache = cr + cw
+            cost = r["cost"] or 0
+            e = out.setdefault(day, {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "cost": 0.0})
+            e["ti"] += ti
+            e["to"] += to
+            e["tr"] += tr
+            e["cache"] += cache
+            e["cost"] += cost
+    except Exception:
+        pass
+    finally:
+        try:
+            lcon.close()
+        except Exception:
+            pass
+    return out
+
+
+def merge_ledger_into_stats(stats, db_path):
+    agg = ledger_totals(db_path)
+    if not agg or agg["sessions"] <= 0:
+        return stats
+    stats["totals"]["sessions"] = agg["sessions"]
+    if agg["messages"] > 0:
+        stats["totals"]["messages"] = agg["messages"]
+    stats["totals"]["tokens_input"] = agg["ti"]
+    stats["totals"]["tokens_output"] = agg["to"]
+    stats["totals"]["tokens_reasoning"] = agg["tr"]
+    stats["totals"]["tokens_cache_read"] = agg["cr"]
+    stats["totals"]["tokens_cache_write"] = agg["cw"]
+    stats["totals"]["cost"] = agg["cost"]
+    total_tokens = agg["ti"] + agg["to"] + agg["tr"] + agg["cr"] + agg["cw"]
+    stats["totals"]["tokens_total"] = total_tokens
+    stats["totals"]["cache_rate"] = cache_rate(agg["ti"], agg["cr"])
+    stats["totals"]["avg_tokens_per_session"] = (
+        round(total_tokens / agg["sessions"], 0) if agg["sessions"] else 0
+    )
+
+    ldays = ledger_day_tokens(db_path)
+    existing_dates = {e["date"] for e in stats["days"]}
+    for e in stats["days"]:
+        ld = ldays.get(e["date"])
+        if ld:
+            e["ti"] = round(ld["ti"], 4)
+            e["to"] = round(ld["to"], 4)
+            e["tr"] = round(ld["tr"], 4)
+            e["cache"] = round(ld["cache"], 4)
+            e["cost"] = round(ld["cost"], 4)
+        else:
+            e["ti"] = 0
+            e["to"] = 0
+            e["tr"] = 0
+            e["cache"] = 0
+            e["cost"] = 0
+        e["total"] = round(e["ti"] + e["to"] + e["tr"] + e["cache"], 1)
+    for date, ld in ldays.items():
+        if date not in existing_dates:
+            stats["days"].append(
+                {
+                    "date": date,
+                    "msgs": 0,
+                    "sessions": 0,
+                    "ti": round(ld["ti"], 4),
+                    "to": round(ld["to"], 4),
+                    "tr": round(ld["tr"], 4),
+                    "cache": round(ld["cache"], 4),
+                    "cost": round(ld["cost"], 4),
+                    "total": round(ld["ti"] + ld["to"] + ld["tr"] + ld["cache"], 1),
+                }
+            )
+    stats["days"] = sorted(stats["days"], key=lambda x: x["date"])
+
+    for slot in stats.get("activity", []):
+        ld = ldays.get(slot["date"])
+        if ld:
+            slot["ti"] = round(ld["ti"], 4)
+            slot["to"] = round(ld["to"], 4)
+            slot["tr"] = round(ld["tr"], 4)
+            slot["cache"] = round(ld["cache"], 4)
+            slot["cost"] = round(ld["cost"], 4)
+        else:
+            slot["ti"] = 0
+            slot["to"] = 0
+            slot["tr"] = 0
+            slot["cache"] = 0
+            slot["cost"] = 0.0
+    return stats
+
+
 def cached_local_stats(db_path):
     path = Path(db_path)
     try:
@@ -811,9 +1101,14 @@ def cached_local_stats(db_path):
             return LOCAL_CACHE["stats"]
     con = connect(db_path)
     try:
+        sync_session_ledger(db_path, con)
         stats = query_stats(con)
     finally:
         con.close()
+    try:
+        stats = merge_ledger_into_stats(stats, db_path)
+    except Exception:
+        pass
     with LOCK:
         LOCAL_CACHE["key"] = fingerprint
         LOCAL_CACHE["stats"] = stats
@@ -1680,33 +1975,60 @@ def cached_cline_stats(cline_dir, worktrees=None):
 
 
 def session_prompts(con, session_id):
-    """Prompts for one session — from session_input when available, otherwise
-    reconstructed from user text parts (older opencode versions)."""
-    rows = [
-        {"t": r["time_created"], "p": r["prompt"]}
-        for r in con.execute(
-            "SELECT time_created, prompt FROM session_input "
-            "WHERE session_id=? ORDER BY time_created",
-            (session_id,),
-        )
-    ]
-    if rows:
-        return rows[-50:]
+    """Prompts for one session — from session_input / session_message when
+    available, otherwise reconstructed from user text parts."""
+    # Legacy session_input table (OpenCode 1.0).
+    try:
+        if has_table(con, "session_input"):
+            rows = [
+                {"t": r["time_created"], "p": r["prompt"]}
+                for r in con.execute(
+                    "SELECT time_created, prompt FROM session_input "
+                    "WHERE session_id=? ORDER BY time_created",
+                    (session_id,),
+                )
+            ]
+            if rows:
+                return rows[-50:]
+    except sqlite3.Error:
+        pass
+    # OpenCode 2.0: user messages live in session_message with data.text.
+    try:
+        if has_table(con, "session_message"):
+            rows = []
+            for r in con.execute(
+                "SELECT time_created, json_extract(data,'$.text') AS txt "
+                "FROM session_message WHERE session_id=? AND type='user' "
+                "ORDER BY time_created",
+                (session_id,),
+            ):
+                txt = (r["txt"] or "").strip()
+                if txt:
+                    rows.append({"t": r["time_created"], "p": txt})
+            if rows:
+                return rows[-50:]
+    except sqlite3.Error:
+        pass
+    # Fallback: user text parts.
+    MT = message_table(con)
     rows = []
-    for r in con.execute(
-        """
-        SELECT p.time_created, json_extract(p.data,'$.text') AS txt
-        FROM part p JOIN message m ON m.id = p.message_id
-        WHERE p.session_id = ?
-          AND json_extract(p.data,'$.type')='text'
-          AND json_extract(m.data,'$.role')='user'
-        ORDER BY p.time_created
-        """,
-        (session_id,),
-    ):
-        txt = (r["txt"] or "").strip()
-        if txt:
-            rows.append({"t": r["time_created"], "p": txt})
+    try:
+        for r in con.execute(
+            f"""
+            SELECT p.time_created, json_extract(p.data,'$.text') AS txt
+            FROM part p LEFT JOIN {MT} m ON m.id = p.message_id
+            WHERE p.session_id = ?
+              AND json_extract(p.data,'$.type')='text'
+              AND (m.id IS NULL OR json_extract(m.data,'$.role')='user')
+            ORDER BY p.time_created
+            """,
+            (session_id,),
+        ):
+            txt = (r["txt"] or "").strip()
+            if txt:
+                rows.append({"t": r["time_created"], "p": txt})
+    except sqlite3.Error:
+        pass
     return rows[-50:]
 
 
