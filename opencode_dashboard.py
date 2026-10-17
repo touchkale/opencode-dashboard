@@ -379,9 +379,10 @@ def query_stats(con):
     # matching the session rollups exactly.
     tokens_by_day = {}
     for r in con.execute(
-        """
+        f"""
         SELECT time_created, data FROM part
         WHERE json_extract(data,'$.type')='step-finish'
+          AND session_id IN (SELECT id FROM {ST})
         """
     ):
         try:
@@ -530,10 +531,11 @@ def query_stats(con):
     sess_files = defaultdict(set)
     try:
         for r in con.execute(
-            """SELECT session_id, json_extract(data,'$.state.input.filePath') AS fp
+            f"""SELECT session_id, json_extract(data,'$.state.input.filePath') AS fp
                FROM part
                WHERE json_extract(data,'$.type')='tool'
-                 AND json_extract(data,'$.tool') IN ('edit','write')"""
+                 AND json_extract(data,'$.tool') IN ('edit','write')
+                 AND session_id IN (SELECT id FROM {ST})"""
         ):
             if r["fp"] and r["session_id"]:
                 sess_files[r["session_id"]].add(r["fp"])
@@ -885,11 +887,16 @@ def sync_session_ledger(db_path, con):
                 msgs[r["session_id"]] = r["c"]
         except sqlite3.Error:
             pass
-        rows = con.execute(
-            f"""SELECT id, title, agent, model, project_id, time_created, time_updated,
-                       tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
-                       tokens_cache_write, cost FROM {ST}"""
-        ).fetchall()
+        rows = []
+        query_failed = False
+        try:
+            rows = con.execute(
+                f"""SELECT id, title, agent, model, project_id, time_created, time_updated,
+                           tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
+                           tokens_cache_write, cost FROM {ST}"""
+            ).fetchall()
+        except sqlite3.Error:
+            query_failed = True
         now = int(time.time() * 1000)
         cur_ids = []
         for r in rows:
@@ -921,12 +928,17 @@ def sync_session_ledger(db_path, con):
                     r["cost"] or 0, msgs.get(sid, 0), now,
                 ),
             )
-        if cur_ids:
-            placeholders = ",".join("?" for _ in cur_ids)
-            lcon.execute(
-                f"UPDATE session_usage SET deleted=1 WHERE session_id NOT IN ({placeholders})",
-                cur_ids,
-            )
+        if not query_failed:
+            if cur_ids:
+                placeholders = ",".join("?" for _ in cur_ids)
+                lcon.execute(
+                    f"UPDATE session_usage SET deleted=1 WHERE session_id NOT IN ({placeholders})",
+                    cur_ids,
+                )
+            else:
+                # Every chat is gone from the source: keep the history and mark
+                # all retained ledger rows deleted instead of leaving them live.
+                lcon.execute("UPDATE session_usage SET deleted=1")
         lcon.commit()
     except Exception:
         pass
@@ -976,6 +988,12 @@ def ledger_totals(db_path):
 
 
 def ledger_day_tokens(db_path):
+    """Per-day ledger rollup: tokens/cost plus session and message counts.
+
+    Days are keyed like everywhere else ('YYYY-MM-DD' local time, from each
+    ledger session's creation time), so callers can overwrite live per-day
+    rows after chats are deleted without changing shape.
+    """
     out = {}
     try:
         lcon = ledger_connect(db_path)
@@ -984,7 +1002,7 @@ def ledger_day_tokens(db_path):
     try:
         for r in lcon.execute(
             """SELECT time_created, tokens_input, tokens_output, tokens_reasoning,
-                      tokens_cache_read, tokens_cache_write, cost
+                      tokens_cache_read, tokens_cache_write, cost, msgs
                FROM session_usage"""
         ):
             ms = r["time_created"] or 0
@@ -998,12 +1016,18 @@ def ledger_day_tokens(db_path):
             cw = r["tokens_cache_write"] or 0
             cache = cr + cw
             cost = r["cost"] or 0
-            e = out.setdefault(day, {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "cost": 0.0})
+            e = out.setdefault(
+                day,
+                {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "cost": 0.0,
+                 "sessions": 0, "msgs": 0},
+            )
             e["ti"] += ti
             e["to"] += to
             e["tr"] += tr
             e["cache"] += cache
             e["cost"] += cost
+            e["sessions"] += 1
+            e["msgs"] += r["msgs"] or 0
     except Exception:
         pass
     finally:
@@ -1012,6 +1036,153 @@ def ledger_day_tokens(db_path):
         except Exception:
             pass
     return out
+
+
+def ledger_rollups(db_path, ldays):
+    """Rebuild model/agent/project/record rollups from the persistent ledger.
+
+    query_stats() derives these from live sessions, which go empty once every
+    chat is deleted. The ledger keeps one row per session forever, so these
+    rollups let the panels, records and date range survive deletion. Row
+    shapes match the live payloads exactly. Returns None when the ledger is
+    unreadable so callers can keep the live values.
+    """
+    try:
+        lcon = ledger_connect(db_path)
+    except Exception:
+        return None
+    try:
+        models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0})
+        for r in lcon.execute(
+            """SELECT model, COUNT(*) AS n,
+                      COALESCE(SUM(tokens_input),0) AS ti,
+                      COALESCE(SUM(tokens_output),0) AS to_,
+                      COALESCE(SUM(tokens_reasoning),0) AS tr,
+                      COALESCE(SUM(tokens_cache_read),0)
+                        +COALESCE(SUM(tokens_cache_write),0) AS ca,
+                      COALESCE(SUM(cost),0) AS cost
+               FROM session_usage GROUP BY model"""
+        ):
+            m = models[parse_model(r["model"])]
+            m["n"] += r["n"]
+            m["ti"] += r["ti"]
+            m["to"] += r["to_"]
+            m["tr"] += r["tr"]
+            m["cache"] += r["ca"]
+            m["cost"] += r["cost"]
+        model_rows = []
+        for k, v in models.items():
+            tot = v["ti"] + v["to"] + v["tr"] + v["cache"]
+            model_rows.append(
+                [k, v["n"], tot, v["ti"], v["to"], v["tr"], v["cache"], v["cost"],
+                 round(tot / v["n"], 0) if v["n"] else 0,
+                 cache_rate(v["ti"], v["cache"])]
+            )
+        model_rows.sort(key=lambda kv: -kv[2])
+
+        agents = defaultdict(lambda: {"n": 0, "toks": 0})
+        for r in lcon.execute(
+            """SELECT agent, COUNT(*) AS n,
+                      COALESCE(SUM(tokens_input)+SUM(tokens_output)+SUM(tokens_reasoning)
+                               +SUM(tokens_cache_read)+SUM(tokens_cache_write),0) AS t
+               FROM session_usage GROUP BY agent"""
+        ):
+            a = r["agent"] or "default"
+            agents[a]["n"] += r["n"]
+            agents[a]["toks"] += r["t"]
+        agent_rows = sorted(
+            [[k, v["n"], v["toks"]] for k, v in agents.items()], key=lambda kv: -kv[1]
+        )
+
+        projects = defaultdict(lambda: {"n": 0, "toks": 0})
+        for r in lcon.execute(
+            """SELECT project_name, COUNT(*) AS n,
+                      COALESCE(SUM(tokens_input)+SUM(tokens_output)+SUM(tokens_reasoning)
+                               +SUM(tokens_cache_read)+SUM(tokens_cache_write),0) AS t
+               FROM session_usage GROUP BY project_name"""
+        ):
+            key = r["project_name"] or "—"
+            projects[key]["n"] += r["n"]
+            projects[key]["toks"] += r["t"]
+        project_rows = sorted(
+            [[k, v["n"], v["toks"]] for k, v in projects.items()], key=lambda kv: -kv[2]
+        )
+
+        records = {
+            "biggest_day": None,
+            "biggest_session": None,
+            "fastest_burn": None,
+            "streaks": {"current": 0, "longest": 0},
+        }
+        for date, ld in ldays.items():
+            tot = ld["ti"] + ld["to"] + ld["tr"] + ld["cache"]
+            if records["biggest_day"] is None or tot > records["biggest_day"]["total"]:
+                records["biggest_day"] = {
+                    "date": date,
+                    "total": round(tot, 1),
+                    "sessions": ld.get("sessions", 0),
+                }
+        row = lcon.execute(
+            """SELECT title, model,
+                      COALESCE(tokens_input,0)+COALESCE(tokens_output,0)
+                        +COALESCE(tokens_reasoning,0)+COALESCE(tokens_cache_read,0)
+                        +COALESCE(tokens_cache_write,0) AS tot
+               FROM session_usage ORDER BY tot DESC LIMIT 1"""
+        ).fetchone()
+        if row and row["tot"]:
+            records["biggest_session"] = {
+                "title": row["title"],
+                "total": row["tot"],
+                "model": parse_model(row["model"]),
+            }
+        row = lcon.execute(
+            """SELECT title,
+                      (COALESCE(tokens_input,0)+COALESCE(tokens_output,0)
+                        +COALESCE(tokens_reasoning,0)+COALESCE(tokens_cache_read,0)
+                        +COALESCE(tokens_cache_write,0)) AS tot,
+                      (time_updated-time_created)/60000.0 AS mins
+               FROM session_usage
+               WHERE time_created>0 AND time_updated>time_created
+                 AND (time_updated-time_created) >= 30000
+               ORDER BY tot/((time_updated-time_created)/60000.0) DESC LIMIT 1"""
+        ).fetchone()
+        if row and row["mins"]:
+            records["fastest_burn"] = {
+                "title": row["title"],
+                "burn": round(row["tot"] / row["mins"], 0),
+            }
+        activity = zero_days_window()
+        for slot in activity:
+            ld = ldays.get(slot["date"])
+            if not ld:
+                continue
+            slot["ti"] = ld["ti"]
+            slot["to"] = ld["to"]
+            slot["tr"] = ld["tr"]
+            slot["cache"] = ld["cache"]
+            slot["msgs"] = ld.get("msgs", 0)
+            slot["sessions"] = ld.get("sessions", 0)
+        records["streaks"] = compute_streaks(activity, tokens_only=True)
+
+        if ldays:
+            dates = sorted(ldays)
+            rng = f"{dates[0]} → {dates[-1]}"
+        else:
+            rng = "no activity"
+        return {
+            "models": model_rows,
+            "agents": agent_rows,
+            "projects": project_rows,
+            "records": records,
+            "range": rng,
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            lcon.close()
+        except Exception:
+            pass
 
 
 def merge_ledger_into_stats(stats, db_path):
@@ -1044,6 +1215,10 @@ def merge_ledger_into_stats(stats, db_path):
             e["tr"] = round(ld["tr"], 4)
             e["cache"] = round(ld["cache"], 4)
             e["cost"] = round(ld["cost"], 4)
+            # Ledger session/message counts keep the daily table historical
+            # even after the live rows behind them are deleted.
+            e["msgs"] = ld["msgs"]
+            e["sessions"] = ld["sessions"]
         else:
             e["ti"] = 0
             e["to"] = 0
@@ -1056,8 +1231,8 @@ def merge_ledger_into_stats(stats, db_path):
             stats["days"].append(
                 {
                     "date": date,
-                    "msgs": 0,
-                    "sessions": 0,
+                    "msgs": ld["msgs"],
+                    "sessions": ld["sessions"],
                     "ti": round(ld["ti"], 4),
                     "to": round(ld["to"], 4),
                     "tr": round(ld["tr"], 4),
@@ -1076,12 +1251,38 @@ def merge_ledger_into_stats(stats, db_path):
             slot["tr"] = round(ld["tr"], 4)
             slot["cache"] = round(ld["cache"], 4)
             slot["cost"] = round(ld["cost"], 4)
+            slot["msgs"] = ld["msgs"]
+            slot["sessions"] = ld["sessions"]
         else:
             slot["ti"] = 0
             slot["to"] = 0
             slot["tr"] = 0
             slot["cache"] = 0
             slot["cost"] = 0.0
+
+    # Historical rollups: models/agents/projects/records/range are rebuilt
+    # from the ledger so a fully-deleted chat history still reports them.
+    rollups = ledger_rollups(db_path, ldays)
+    if rollups:
+        stats["models"] = rollups["models"]
+        stats["agents"] = rollups["agents"]
+        stats["projects"] = rollups["projects"]
+        stats["records"] = rollups["records"]
+        stats["range"] = rollups["range"]
+    if stats.get("insights"):
+        stats["insights"][0] = (
+            f"Across {agg['sessions']} sessions you used {total_tokens:,.0f} tokens "
+            f"in {stats['totals']['messages']:,} messages."
+        )
+        # The live "no activity" line would contradict the rehydrated records.
+        stale = "No activity recorded yet."
+        if rollups and rollups["records"]["biggest_day"]:
+            bd = rollups["records"]["biggest_day"]
+            fresh = (
+                f"Your biggest token day was {bd['date']} — {bd['total']:,.0f} tokens "
+                f"across {bd['sessions']} sessions."
+            )
+            stats["insights"] = [fresh if i == stale else i for i in stats["insights"]]
     return stats
 
 
@@ -2011,6 +2212,13 @@ def session_prompts(con, session_id):
         pass
     # Fallback: user text parts.
     MT = message_table(con)
+    # 2.0 messages carry a `type` column ('user'/'assistant'); 1.0 messages
+    # carry data.role instead. Pick the right user check for the active schema.
+    user_check = (
+        "m.type='user'"
+        if MT == "session_message"
+        else "json_extract(m.data,'$.role')='user'"
+    )
     rows = []
     try:
         for r in con.execute(
@@ -2019,7 +2227,7 @@ def session_prompts(con, session_id):
             FROM part p LEFT JOIN {MT} m ON m.id = p.message_id
             WHERE p.session_id = ?
               AND json_extract(p.data,'$.type')='text'
-              AND (m.id IS NULL OR json_extract(m.data,'$.role')='user')
+              AND (m.id IS NULL OR {user_check})
             ORDER BY p.time_created
             """,
             (session_id,),
@@ -4297,12 +4505,17 @@ class Handler(BaseHTTPRequestHandler):
     cline_dir = None
     server = None
     quiet = False
+    # When True (TUI mode) the background HTTP server outlives Chrome windows:
+    # closing the web UI only closes that window, never the server.
+    keep_alive = False
 
     def _cancel_close(self):
         _cancel_close_timer()
 
     @staticmethod
     def _close_now():
+        if Handler.keep_alive:
+            return
         if Handler.server:
             Handler.server.shutdown()
 
@@ -4430,6 +4643,8 @@ class Handler(BaseHTTPRequestHandler):
                     WINDOWS.pop(wid, None)
                 now = time.time()
                 others = any(now - last < 90 for w, last in WINDOWS.items())
+            if Handler.keep_alive:
+                return  # TUI owns the server; a closed Chrome window is harmless
             if not others:
                 self._arm_close()
         else:
@@ -4494,28 +4709,86 @@ def _safe_addstr(win, y, x, text, attr=0):
         return
     try:
         win.addstr(y, x, str(text)[: max(0, w - x - 1)], attr)
-    except curses.error:
+    except Exception:
+        # curses.error on the bottom-right cell is expected; encoding errors
+        # from odd DB text should never take the whole TUI down.
         pass
+
+
+def open_chrome_window(url):
+    """Open `url` in the same dedicated Chrome app window the old launcher used.
+
+    Returns True when a browser was launched. On non-macOS (or when Chrome is
+    not installed) fall back to the system default browser.
+    """
+    import webbrowser
+
+    if url and sys.platform == "darwin":
+        chrome = Path("/Applications/Google Chrome.app")
+        if chrome.is_dir():
+            profile = str(Path.home() / ".cache" / "ocd-dashboard-chrome")
+            try:
+                subprocess.Popen(
+                    [
+                        "open", "-na", str(chrome), "--args",
+                        f"--app={url}",
+                        f"--user-data-dir={profile}",
+                        "--window-size=1280,1600",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            except Exception:
+                pass
+    if not url:
+        return False
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 def run_tui(args):
     import curses
-    import webbrowser
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
     Handler.cline_dir = args.cline_dir
     Handler.quiet = True
+    # The TUI owns the server: closing the Chrome window must not stop it.
+    Handler.keep_alive = True
 
     # Background web server so the traditional Chrome UI can be opened on demand.
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    # If the requested port is busy, walk forward through the next 10 ports.
+    server = None
+    url = None
+    last_error = None
+    for offset in range(11):
+        port = args.port + offset
+        if port > 65535:
+            break
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            url = f"http://127.0.0.1:{port}"
+            break
+        except OSError as e:
+            last_error = e
     Handler.server = server
-    url = f"http://127.0.0.1:{args.port}"
-    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    srv_thread.start()
+    srv_thread = None
+    if server is not None:
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+    else:
+        print(
+            f"warning: could not bind any port {args.port}-{args.port + 10} "
+            f"({last_error}); Chrome UI disabled",
+            file=sys.stderr,
+        )
 
-    state = {"tab": 0, "S": None, "R": None, "C": None, "msg": "", "last": 0.0}
+    state = {"tab": 0, "S": None, "R": None, "C": None, "msg": "", "last": 0.0,
+             "url": url}
     tabs = ["OpenCode", "Codex", "Cline", "Recap"]
 
     def load_data():
@@ -4535,7 +4808,10 @@ def run_tui(args):
         except Exception:
             state["C"] = None
         state["last"] = time.time()
-        state["msg"] = "Ready  (r refresh, o open Chrome UI, q quit)"
+        if state["url"]:
+            state["msg"] = "Ready  (r refresh, o open Chrome UI, q quit)"
+        else:
+            state["msg"] = f"No Chrome UI server: ports {args.port}-{args.port + 10} busy"
 
     def draw(stdscr):
         stdscr.erase()
@@ -4587,10 +4863,57 @@ def run_tui(args):
             _safe_addstr(stdscr, y, 30, str(value), curses.A_BOLD)
             y += 1
 
+        def fmt_cost(value):
+            c = num(value)
+            if c <= 0:
+                return "$0"
+            if c < 0.01:
+                return f"${c:.4f}"
+            return f"${c:,.2f}"
+
+        def draw_models(models, cost_idx, free_idx=None):
+            """Top-models block: name, tokens, cost and a free/$0 marker."""
+            nonlocal y
+            name_w = max(10, min(44, w - 38))
+            if y < h - 2:
+                _safe_addstr(
+                    stdscr, y, 4,
+                    f"{'model':<{name_w}} {'tokens':>9}  {'cost':>8}",
+                    DIM,
+                )
+                y += 1
+            for m in (models or [])[:8]:
+                if y >= h - 2:
+                    break
+                if isinstance(m, (list, tuple)):
+                    name = str(m[0]) if len(m) > 0 else "?"
+                    tot = m[2] if len(m) > 2 else 0
+                    cost = num(m[cost_idx]) if len(m) > cost_idx else 0.0
+                    is_free = bool(m[free_idx]) if free_idx is not None and len(m) > free_idx else False
+                else:
+                    name = str(m.get("name", "?"))
+                    tot = m.get("tokens_total", 0)
+                    cost = num(m.get("cost"))
+                    is_free = bool(m.get("free"))
+                if "free" in name.lower() or is_free:
+                    badge = " free"
+                elif num(cost) <= 0:
+                    badge = " $0"
+                else:
+                    badge = ""
+                row = (
+                    f"{name[:name_w]:<{name_w}} {_fmt(tot):>9}  "
+                    f"{fmt_cost(cost):>8}{badge}"
+                )
+                _safe_addstr(stdscr, y, 4, row, GOOD if badge else 0)
+                y += 1
+
         if state["tab"] == 0:  # OpenCode
-            _safe_addstr(stdscr, y, 2, "OpenCode (local)", ACC); y += 2
+            _safe_addstr(stdscr, y, 2, "OpenCode (local)", ACC)
+            y += 2
             if not S:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No data", WARN); y += 2
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No data", WARN)
+                y += 2
             else:
                 t = S.get("totals", {})
                 kpi("Sessions", _fmt(t.get("sessions", 0)))
@@ -4603,16 +4926,12 @@ def run_tui(args):
                 kpi("Cost (USD)", f"${t.get('cost', 0):.2f}")
                 kpi("Cache rate", f"{t.get('cache_rate', 0):.1f}%")
                 y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
-                for m in (S.get("models") or [])[:8]:
-                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
-                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
-                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
-                    y += 1
-                    if y >= h - 4:
-                        break
+                _safe_addstr(stdscr, y, 2, "Top models", ACC)
                 y += 1
-                _safe_addstr(stdscr, y, 2, "Recent days", ACC); y += 1
+                draw_models(S.get("models"), 7)
+                y += 1
+                _safe_addstr(stdscr, y, 2, "Recent days", ACC)
+                y += 1
                 for d_ in (S.get("days") or [])[-7:]:
                     _safe_addstr(stdscr, y, 4, f"{d_.get('date')}  msgs={d_.get('msgs', 0):<5} tokens={_fmt(d_.get('total', 0))}", 0)
                     y += 1
@@ -4620,9 +4939,11 @@ def run_tui(args):
                         break
 
         elif state["tab"] == 1:  # Codex/router
-            _safe_addstr(stdscr, y, 2, "Codex Router", ACC); y += 2
+            _safe_addstr(stdscr, y, 2, "Codex Router", ACC)
+            y += 2
             if not R:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No router data", WARN); y += 2
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No router data", WARN)
+                y += 2
             else:
                 t = R.get("totals", {})
                 kpi("Requests", _fmt(t.get("requests", 0)))
@@ -4633,19 +4954,16 @@ def run_tui(args):
                 kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
                 kpi("What-if cost", f"${t.get('what_if_cost', 0):.2f}")
                 y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
-                for m in (R.get("models") or [])[:8]:
-                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
-                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
-                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
-                    y += 1
-                    if y >= h - 4:
-                        break
+                _safe_addstr(stdscr, y, 2, "Top models", ACC)
+                y += 1
+                draw_models(R.get("models"), 12, 11)
 
         elif state["tab"] == 2:  # Cline
-            _safe_addstr(stdscr, y, 2, "Cline Desktop", ACC); y += 2
+            _safe_addstr(stdscr, y, 2, "Cline Desktop", ACC)
+            y += 2
             if not C:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No cline data", WARN); y += 2
+                _safe_addstr(stdscr, y, 2, state["msg"] or "No cline data", WARN)
+                y += 2
             else:
                 t = C.get("totals", {})
                 kpi("Requests", _fmt(t.get("requests", 0)))
@@ -4655,30 +4973,33 @@ def run_tui(args):
                 kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
                 kpi("Tokens (cache)", _fmt(t.get("tokens_cache_read", 0) + t.get("tokens_cache_write", 0)))
                 y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC); y += 1
-                for m in (C.get("models") or [])[:8]:
-                    name = m[0] if isinstance(m, (list, tuple)) else m.get("name", "?")
-                    tot = m[2] if isinstance(m, (list, tuple)) else m.get("tokens_total", 0)
-                    _safe_addstr(stdscr, y, 4, f"{str(name)[:40]:<40} {_fmt(tot):>10}", 0)
-                    y += 1
-                    if y >= h - 4:
-                        break
+                _safe_addstr(stdscr, y, 2, "Top models", ACC)
+                y += 1
+                draw_models(C.get("models"), 12, 11)
 
         else:  # Recap
-            _safe_addstr(stdscr, y, 2, "Recap (all harnesses)", ACC); y += 2
+            _safe_addstr(stdscr, y, 2, "Recap (all harnesses)", ACC)
+            y += 2
             oc = (S.get("totals", {}).get("tokens_total", 0) if S else 0)
             rx = (R.get("totals", {}).get("tokens_total", 0) if R else 0)
             cx = (C.get("totals", {}).get("tokens_total", 0) if C else 0)
             total = oc + rx + cx
-            _safe_addstr(stdscr, y, 2, f"TOTAL TOKENS: {_fmt(total)}", MAG); y += 2
+            _safe_addstr(stdscr, y, 2, f"TOTAL TOKENS: {_fmt(total)}", MAG)
+            y += 2
             kpi("OpenCode", _fmt(oc))
             kpi("Codex", _fmt(rx))
             kpi("Cline", _fmt(cx))
             y += 1
-            _safe_addstr(stdscr, y, 2, "Open traditional Chrome UI for full charts: press 'o'", DIM); y += 1
+            _safe_addstr(stdscr, y, 2, "Open traditional Chrome UI for full charts: press 'o'", DIM)
+            y += 1
 
         # footer
-        foot = " q quit | r refresh | 1-4 tabs | o open Chrome UI | arrows/tab switch "
+        if state["url"]:
+            _safe_addstr(stdscr, h - 3, 0, f" Chrome UI: {state['url']}  (o opens it)", ACC)
+            open_hint = "o open Chrome UI"
+        else:
+            open_hint = "o unavailable"
+        foot = f" q quit | r refresh | 1-4 tabs | {open_hint} | arrows/tab switch "
         _safe_addstr(stdscr, h - 2, 0, "─" * (w - 1), DIM)
         _safe_addstr(stdscr, h - 1, 0, foot[: w - 1], DIM)
         _safe_addstr(stdscr, h - 1, max(0, w - len(state["msg"]) - 1), state["msg"][: w - 1], GOOD)
@@ -4708,14 +5029,19 @@ def run_tui(args):
                     CLINE_CACHE.clear()
                 load_data()
             elif key in (ord("o"), ord("O"), ord("w"), ord("W")):
-                try:
-                    if sys.platform == "darwin":
-                        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        webbrowser.open(url)
-                    state["msg"] = f"Opened {url}"
-                except Exception as e:
-                    state["msg"] = f"Open failed: {e}"
+                if not state["url"]:
+                    state["msg"] = (
+                        f"Chrome UI unavailable: no free port at "
+                        f"{args.port}-{args.port + 10}"
+                    )
+                else:
+                    try:
+                        if open_chrome_window(state["url"]):
+                            state["msg"] = f"Opened {state['url']}"
+                        else:
+                            state["msg"] = f"Could not open a browser for {state['url']}"
+                    except Exception as e:
+                        state["msg"] = f"Open failed: {e}"
             elif key in (9, curses.KEY_RIGHT):
                 state["tab"] = (state["tab"] + 1) % len(tabs)
             elif key == curses.KEY_LEFT:
@@ -4726,9 +5052,13 @@ def run_tui(args):
     try:
         curses.wrapper(main_loop)
     finally:
+        Handler.keep_alive = False
         try:
-            server.shutdown()
-            server.server_close()
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if srv_thread is not None:
+                srv_thread.join(timeout=2)
         except Exception:
             pass
 

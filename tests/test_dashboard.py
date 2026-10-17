@@ -54,6 +54,87 @@ def seed_db(path, n_sessions=40, days_back_max=400):
     con.close()
 
 
+def seed_db_2_0(path, n_sessions=5):
+    """Create an OpenCode 2.0-shaped SQLite DB (session_v2/session_message).
+
+    Also includes legacy `session`/`message` rows plus legacy parts, which a
+    2.0 database can carry over; stats must ignore all of it and only count
+    session_v2 / session_message / parts belonging to those sessions.
+    """
+    con = sqlite3.connect(path)
+    c = con.cursor()
+    c.executescript("""
+    CREATE TABLE session_v2(id TEXT PRIMARY KEY, title TEXT, agent TEXT, model TEXT,
+      time_created INTEGER, time_updated INTEGER, tokens_input INTEGER, tokens_output INTEGER,
+      tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER,
+      cost REAL, project_id TEXT);
+    CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+      time_created INTEGER, data TEXT);
+    CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE project(id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+    CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, agent TEXT, model TEXT,
+      time_created INTEGER, time_updated INTEGER, tokens_input INTEGER, tokens_output INTEGER,
+      tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER,
+      cost REAL, project_id TEXT);
+    CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    """)
+    c.execute("INSERT INTO project VALUES ('p1','Demo','/work/demo')")
+    now_ms = int(datetime.now().timestamp() * 1000)
+    model = json.dumps({"id": "opencode-go/deepseek-v4-flash"})
+    for i in range(n_sessions):
+        sid = f"v{i:04d}"
+        start = now_ms - i * 1000
+        c.execute(
+            "INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, f"V2 Session {i}", "build", model, start, start + 60000,
+             100, 50, 10, 200, 0, 0.001, "p1"),
+        )
+        c.execute(
+            "INSERT INTO session_message VALUES (?,?,?,?,?)",
+            (f"{sid}-u", sid, "user", start, json.dumps({"type": "user", "text": f"prompt {i}"})),
+        )
+        c.execute(
+            "INSERT INTO session_message VALUES (?,?,?,?,?)",
+            (f"{sid}-a", sid, "assistant", start + 1, json.dumps({"type": "assistant"})),
+        )
+        c.execute(
+            "INSERT INTO part VALUES (?,?,?,?,?)",
+            (f"{sid}-step", f"{sid}-a", sid, start + 1, json.dumps(
+                {"type": "step-finish",
+                 "tokens": {"input": 100, "output": 50, "reasoning": 10, "total": 400,
+                            "cache": {"read": 40}},
+                 "cost": 0.001})),
+        )
+    # s v0000 touched a file, attributed through the part scan
+    c.execute(
+        "INSERT INTO part VALUES ('v0000-edit','v0000-a','v0000',?,?)",
+        (now_ms, json.dumps({"type": "tool", "tool": "edit",
+                             "state": {"input": {"filePath": "/work/demo/app/a.py"}}})),
+    )
+    # legacy rows + legacy parts that must be excluded from every 2.0 aggregate
+    c.execute(
+        "INSERT INTO session VALUES ('legacy1','Legacy','build',?,?,?,?,?,?,?,?,?,?)",
+        (json.dumps({"id": "anthropic/claude-sonnet-4-6"}), now_ms - 999000,
+         now_ms - 998000, 900000, 900000, 0, 0, 0, 12.5, "p1"),
+    )
+    c.execute("INSERT INTO message VALUES ('lm1','legacy1',?,?)",
+              (now_ms - 999000, json.dumps({"role": "user"})))
+    c.execute(
+        "INSERT INTO part VALUES ('lp1','lm1','legacy1',?,?)",
+        (now_ms - 999000, json.dumps(
+            {"type": "step-finish",
+             "tokens": {"input": 900000, "output": 900000, "reasoning": 0, "total": 1800000},
+             "cost": 12.5})),
+    )
+    c.execute(
+        "INSERT INTO part VALUES ('lp2','lm1','legacy1',?,?)",
+        (now_ms - 999000, json.dumps({"type": "tool", "tool": "edit",
+                                      "state": {"input": {"filePath": "/legacy/old.py"}}})),
+    )
+    con.commit()
+    con.close()
+
+
 @pytest.fixture
 def db_path(tmp_path):
     path = str(tmp_path / "opencode.db")
@@ -166,6 +247,281 @@ def test_query_stats_caps_sessions(tmp_path):
         con.close()
     assert len(stats["sessions"]) == d.MAX_SESSION_ROWS
     assert stats["totals"]["sessions"] == 800
+
+
+def test_query_stats_opencode_2_0_schema(tmp_path):
+    path = str(tmp_path / "opencode.db")
+    seed_db_2_0(path, n_sessions=5)
+    con = d.connect(path)
+    try:
+        stats = d.query_stats(con)
+        prompts = d.session_prompts(con, "v0000")
+    finally:
+        con.close()
+    # session_v2 / session_message only: the legacy session/message rows are ignored
+    assert stats["totals"]["sessions"] == 5
+    assert stats["totals"]["messages"] == 10
+    assert stats["totals"]["tokens_input"] == 500
+    assert stats["totals"]["tokens_output"] == 250
+    assert stats["totals"]["tokens_reasoning"] == 50
+    assert stats["totals"]["tokens_cache_read"] == 1000
+    assert stats["totals"]["tokens_cache_write"] == 0
+    assert stats["totals"]["tokens_total"] == 1800
+    assert stats["totals"]["cost"] == pytest.approx(0.005)
+    # exactly one model row, from session_v2 (legacy model excluded)
+    assert len(stats["models"]) == 1
+    row = stats["models"][0]
+    assert row[0] == "opencode-go/deepseek-v4-flash"
+    assert row[1] == 5
+    assert row[2] == 1800
+    assert row[7] == pytest.approx(0.005)
+    # per-day token totals come from parts of session_v2 sessions only:
+    # 5 step-finish parts x 400 total tokens (legacy 1.8M part excluded)
+    assert sum(day["total"] for day in stats["days"]) == pytest.approx(2000)
+    assert sum(day["msgs"] for day in stats["days"]) == 10
+    assert sum(day["sessions"] for day in stats["days"]) == 5
+    # file attribution is filtered the same way: only the v2 file is reported
+    assert "/work/demo/app/a.py" in stats["file_subsys"]
+    assert "/legacy/old.py" not in stats["file_subsys"]
+    assert [f[0] for f in stats["files"]] == ["/work/demo/app/a.py"]
+    assert stats["files"][0][1] == pytest.approx(360)  # v0000 session total
+    # 2.0 prompts come from session_message rows with type='user'
+    assert prompts and prompts[0]["p"] == "prompt 0"
+
+
+def test_session_prompts_2_0_text_part_fallback(tmp_path):
+    path = str(tmp_path / "opencode.db")
+    seed_db_2_0(path, n_sessions=2)
+    now = int(datetime.now().timestamp() * 1000)
+    con = sqlite3.connect(path)
+    # v0000's user session_message loses its data.text, so the session_message
+    # scan yields nothing and the part fallback has to recover the prompt.
+    con.execute(
+        "UPDATE session_message SET data=? WHERE id='v0000-u'",
+        (json.dumps({"type": "user"}),),
+    )
+    con.execute(
+        "INSERT INTO part VALUES ('v0000-text','v0000-u','v0000',?,?)",
+        (now, json.dumps({"type": "text", "text": "recovered 2.0 prompt"})),
+    )
+    # assistant text parts must stay excluded (type='assistant' in 2.0)
+    con.execute(
+        "INSERT INTO part VALUES ('v0000-text-a','v0000-a','v0000',?,?)",
+        (now + 1, json.dumps({"type": "text", "text": "assistant text"})),
+    )
+    # orphan text parts (message id that does not join) are still allowed
+    con.execute(
+        "INSERT INTO part VALUES ('v0000-text-orphan','missing','v0000',?,?)",
+        (now + 2, json.dumps({"type": "text", "text": "orphan text"})),
+    )
+    con.commit()
+    con.close()
+    con = d.connect(path)
+    try:
+        prompts = d.session_prompts(con, "v0000")
+    finally:
+        con.close()
+    assert [p["p"] for p in prompts] == ["recovered 2.0 prompt", "orphan text"]
+
+
+def test_ledger_marks_all_sessions_deleted_when_source_empty(tmp_path):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db, n_sessions=3, days_back_max=2)
+    ledger = tmp_path / "opencode.db.usage-ledger.sqlite"
+    if ledger.exists():
+        ledger.unlink()
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    first = d.cached_local_stats(db)
+    lcon = d.ledger_connect(db)
+    try:
+        row = lcon.execute("SELECT COUNT(*) AS n, SUM(deleted) AS d FROM session_usage").fetchone()
+    finally:
+        lcon.close()
+    assert row["n"] == 3 and row["d"] == 0
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM session")
+    con.execute("DELETE FROM message")
+    con.execute("DELETE FROM part")
+    con.commit()
+    con.close()
+    stamp = time.time() + 5
+    os.utime(db, (stamp, stamp))
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    second = d.cached_local_stats(db)
+    lcon = d.ledger_connect(db)
+    try:
+        row = lcon.execute("SELECT COUNT(*) AS n, SUM(deleted) AS d FROM session_usage").fetchone()
+    finally:
+        lcon.close()
+    # all three rows stay in the ledger, all marked deleted
+    assert row["n"] == 3
+    assert row["d"] == 3
+    assert second["totals"]["tokens_total"] == first["totals"]["tokens_total"]
+    assert second["totals"]["sessions"] == first["totals"]["sessions"]
+
+
+def test_ledger_rehydrates_historical_rollups(tmp_path):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db, n_sessions=6, days_back_max=2)
+    ledger = tmp_path / "opencode.db.usage-ledger.sqlite"
+    if ledger.exists():
+        ledger.unlink()
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    first = d.cached_local_stats(db)
+    model = "anthropic/claude-sonnet-4-6"
+    per_session = 1000 + 500 + 100 + 200 + 100  # 1900 tokens in the seed
+    assert [m for m in first["models"] if m[0] == model]
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM session")
+    con.execute("DELETE FROM message")
+    con.execute("DELETE FROM part")
+    con.commit()
+    con.close()
+    stamp = time.time() + 5
+    os.utime(db, (stamp, stamp))
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    second = d.cached_local_stats(db)
+    # totals are unchanged...
+    assert second["totals"]["tokens_total"] == first["totals"]["tokens_total"]
+    assert second["totals"]["sessions"] == first["totals"]["sessions"]
+    assert second["totals"]["messages"] == first["totals"]["messages"]
+    # ...and the historical rollups survive the full deletion
+    assert second["models"]
+    rows = [m for m in second["models"] if m[0] == model]
+    assert rows and len(rows[0]) == 10
+    assert rows[0][1] == 6
+    assert rows[0][2] == 6 * per_session
+    assert second["models"] == sorted(second["models"], key=lambda m: -m[2])
+    assert second["agents"]
+    assert second["agents"][0][0] == "build"
+    assert second["agents"][0][1] == 6
+    assert second["agents"][0][2] == 6 * per_session
+    assert second["projects"]
+    assert second["projects"][0][0] == "Demo"
+    assert second["projects"][0][2] == 6 * per_session
+    rec = second["records"]
+    assert rec["biggest_day"] is not None
+    assert rec["biggest_day"]["sessions"] >= 1
+    assert rec["biggest_session"] is not None
+    assert rec["biggest_session"]["model"] == model
+    assert rec["fastest_burn"] is not None
+    assert rec["streaks"]["longest"] >= 1
+    assert second["range"] != "no activity"
+    # daily session/message counts keep the historical numbers too
+    assert sum(d_["msgs"] for d_ in second["days"]) == 18
+    assert sum(d_["sessions"] for d_ in second["days"]) == 6
+    assert sum(slot["msgs"] for slot in second["activity"]) == 18
+    # first insight is rebuilt from the ledger totals, not the live DB
+    assert "6 sessions" in second["insights"][0]
+    assert "11,400" in second["insights"][0]
+    assert all("No activity recorded yet" not in i for i in second["insights"])
+
+
+def test_ledger_retains_tokens_after_chat_deletion(tmp_path):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db, n_sessions=6, days_back_max=2)
+    ledger = tmp_path / "opencode.db.usage-ledger.sqlite"
+    if ledger.exists():
+        ledger.unlink()
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    first = d.cached_local_stats(db)
+    before = first["totals"]["tokens_total"]
+    before_messages = first["totals"]["messages"]
+    assert before > 0 and before_messages > 0
+    assert ledger.exists()
+    # delete every chat from the source DB, then make sure the cache miss happens
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM session")
+    con.execute("DELETE FROM message")
+    con.execute("DELETE FROM part")
+    con.commit()
+    con.close()
+    stamp = time.time() + 5
+    os.utime(db, (stamp, stamp))
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    second = d.cached_local_stats(db)
+    assert second is not first
+    assert second["totals"]["tokens_total"] == before
+    assert second["totals"]["sessions"] == first["totals"]["sessions"]
+    assert second["totals"]["messages"] == before_messages
+
+
+def test_handler_keep_alive_blocks_shutdown():
+    calls = []
+
+    class FakeServer:
+        def shutdown(self):
+            calls.append(True)
+
+    old_keep = d.Handler.keep_alive
+    old_server = d.Handler.server
+    try:
+        d.Handler.server = FakeServer()
+        d.Handler.keep_alive = True
+        d.Handler._close_now()
+        assert calls == []  # TUI mode: closing the Chrome UI must not stop the server
+        d.Handler.keep_alive = False
+        d.Handler._close_now()
+        assert calls == [True]
+    finally:
+        d.Handler.keep_alive = old_keep
+        d.Handler.server = old_server
+
+
+def test_api_close_does_not_arm_timer_with_keep_alive(monkeypatch):
+    sent = []
+    armed = []
+    monkeypatch.setattr(d.Handler, "_send", lambda self, *a: sent.append(a))
+    monkeypatch.setattr(d.Handler, "_arm_close", lambda self: armed.append(True))
+    handler = object.__new__(d.Handler)
+    handler.path = "/api/close?wid=w1"
+    handler.headers = {}
+    old_keep = d.Handler.keep_alive
+    try:
+        d.Handler.keep_alive = True
+        handler.do_POST()
+        assert sent and armed == []
+        d.Handler.keep_alive = False
+        handler.do_POST()
+        assert armed == [True]
+    finally:
+        d.Handler.keep_alive = old_keep
+
+
+def test_open_chrome_window_matches_launcher(monkeypatch):
+    calls = []
+
+    def fake_popen(args, **kwargs):
+        calls.append(args)
+        return object()
+
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(d.sys, "platform", "darwin")
+    monkeypatch.setattr(d.Path, "is_dir", lambda self: True)
+    assert d.open_chrome_window("http://127.0.0.1:8765") is True
+    cmd = calls[0]
+    assert cmd[0:3] == ["open", "-na", "/Applications/Google Chrome.app"]
+    assert "--app=http://127.0.0.1:8765" in cmd
+    assert "--window-size=1280,1600" in cmd
+    profile = [a for a in cmd if a.startswith("--user-data-dir=")]
+    assert profile and profile[0].endswith("/.cache/ocd-dashboard-chrome")
+    assert d.open_chrome_window(None) is False
+
+
+def test_open_chrome_window_falls_back_to_webbrowser(monkeypatch):
+    import webbrowser
+
+    monkeypatch.setattr(d.sys, "platform", "linux")
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: opened.append(url) or True)
+    assert d.open_chrome_window("http://127.0.0.1:8765") is True
+    assert opened == ["http://127.0.0.1:8765"]
 
 
 def test_activity_window_is_zero_filled(db_path):
@@ -620,7 +976,6 @@ def test_router_commits_time_matched(tmp_path, monkeypatch):
 
 def seed_cline_dir(base, day="2026-09-04"):
     """Create a minimal Cline Desktop data dir: sessions.db + one session."""
-    import time as _time
     base = str(base)
     os.makedirs(os.path.join(base, "sessions", "sess1"), exist_ok=True)
     os.makedirs(os.path.join(base, "db"), exist_ok=True)
