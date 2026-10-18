@@ -3,6 +3,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -532,11 +533,11 @@ def test_tui_layout_is_responsive_and_bounded():
     assert d.tui_layout(40, 10)["cards"] == []
     assert d.tui_layout(40, 10)["chart"] is None
     wide = d.tui_layout(120, 40)
-    assert len(wide["cards"]) == 4
+    assert len(wide["cards"]) == 5  # Today + 4 range/context cards
     assert wide["chart"] and wide["models"] and wide["sessions"] and wide["records"]
     assert wide["card_h"] >= 5
     medium = d.tui_layout(90, 30)
-    assert len(medium["cards"]) == 3
+    assert len(medium["cards"]) == 4  # Today + 3 range/context cards
     assert medium["chart"] and medium["models"] and medium["sessions"]
     narrow = d.tui_layout(70, 24)
     assert len(narrow["cards"]) == 2
@@ -643,10 +644,220 @@ def test_tui_model_badge_and_cost_helpers():
     assert d.tui_free_model_count([["free-x", 1, 1, 0, 0, 0, 0, 0.1],
                                    ["paid", 1, 1, 0, 0, 0, 0, 1.0],
                                    None]) == 1
+    # the synthetic recovered "Other" row is recovered history, not a free model
+    other_row = ["Other", 0, 4_500_000_000, 2_400_000_000, 1_150_000_000,
+                 230_000_000, 720_000_000, 0, 0, 22.0]
+    assert d.tui_model_badge(other_row) == ""
+    assert d.tui_model_badge(other_row, 12) == ""
+    assert d.tui_model_badge(["  other  ", 0, 1, 0, 0, 0, 0, 0.0]) == ""
+    assert d.tui_recovered_badge(other_row) == "recovered"
+    assert d.tui_recovered_badge(["paid", 1, 10, 0, 0, 0, 0, 1.5]) == ""
+    assert d.tui_recovered_badge(None) == ""
+    assert d.tui_free_model_count([other_row,
+                                   ["muse-x-free", 1, 10, 0, 0, 0, 0, 0.0],
+                                   ["zero-cost", 1, 10, 0, 0, 0, 0, 0.0],
+                                   ["paid", 1, 10, 0, 0, 0, 0, 1.5]]) == 2
     assert d.tui_fmt_cost(0) == "$0"
     assert d.tui_fmt_cost(0.0003) == "$0.0003"
     assert d.tui_fmt_cost(1.5) == "$1.50"
     assert d.tui_fmt_cost("bad") == "$0"
+
+
+def test_tui_today_totals_reads_local_date_only():
+    today = datetime.now().date().isoformat()
+    stats = {"days": [
+        {"date": "2020-01-01", "ti": 900, "to": 900, "tr": 0, "cache": 0,
+         "msgs": 9, "sessions": 9},
+        {"date": today, "ti": 10, "to": 5, "tr": 1, "cache": 4,
+         "msgs": 3, "sessions": 2},
+    ]}
+    t = d.tui_today_totals(stats)
+    assert t["found"] is True
+    assert t["tokens_total"] == 20
+    assert (t["ti"], t["to"], t["tr"], t["cache"]) == (10, 5, 1, 4)
+    assert t["messages"] == 3 and t["sessions"] == 2
+    # missing today / missing payload / junk rows are all zeros, never errors
+    assert d.tui_today_totals({"days": [{"date": "2020-01-01"}]})["tokens_total"] == 0
+    assert d.tui_today_totals({"days": []})["found"] is False
+    assert d.tui_today_totals(None)["tokens_total"] == 0
+    assert d.tui_today_totals({"days": [None, "junk"]})["tokens_total"] == 0
+
+
+def test_tui_harness_visibility_and_tab_order():
+    all_visible = {"opencode": True, "router": True, "cline": True}
+    assert d.tui_harness_visibility(None) == all_visible
+    assert d.tui_harness_visibility("not json") == all_visible
+    assert d.tui_harness_visibility({"opencode": False, "router": False,
+                                     "cline": False}) == all_visible
+    assert d.tui_harness_visibility({"opencode": False}) == {
+        "opencode": False, "router": True, "cline": True}
+    # JSON strings from the prefs table are accepted too
+    assert d.tui_harness_visibility('{"router": false}')["router"] is False
+    vis = {"opencode": True, "router": False, "cline": True}
+    assert d.tui_tab_order(vis) == [0, 2, 3]
+    assert d.tui_next_tab(0, 1, vis) == 2
+    assert d.tui_next_tab(2, 1, vis) == 3
+    assert d.tui_next_tab(3, 1, vis) == 0
+    assert d.tui_next_tab(0, -1, vis) == 3
+    # a hidden active tab jumps to the first visible one
+    assert d.tui_next_tab(1, 1, vis) == 0
+    assert d.tui_tab_order({"opencode": False, "router": False, "cline": False}) == [0, 1, 2, 3]
+
+
+def test_ledger_prefs_roundtrip_and_corrupt_values(tmp_path):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db, n_sessions=1)
+    assert d.ledger_get_pref(db, "harness_visibility") is None
+    assert d.ledger_get_pref(db, "missing", default="fallback") == "fallback"
+    value = {"opencode": True, "router": False, "cline": True}
+    assert d.ledger_set_pref(db, "harness_visibility", value) is True
+    assert d.ledger_get_pref(db, "harness_visibility") == value
+    # overwrite works (upsert)
+    assert d.ledger_set_pref(db, "harness_visibility", {"opencode": False}) is True
+    assert d.ledger_get_pref(db, "harness_visibility") == {"opencode": False}
+    # corrupt JSON falls back to the default instead of raising
+    con = d.ledger_connect(db)
+    con.execute("INSERT INTO prefs(key, value) VALUES('bad', '{oops') "
+                "ON CONFLICT(key) DO UPDATE SET value = '{oops'")
+    con.commit()
+    con.close()
+    assert d.ledger_get_pref(db, "bad", default="fallback") == "fallback"
+
+
+def _recovered_stats():
+    return {
+        "totals": {
+            "sessions": 4, "messages": 10,
+            "tokens_input": 100, "tokens_output": 50, "tokens_reasoning": 10,
+            "tokens_cache_read": 30, "tokens_cache_write": 10,
+            "tokens_total": 200, "cache_rate": 23.1, "avg_tokens_per_session": 50,
+            "cost": 1.5,
+        },
+        "models": [["paid/model", 2, 200, 100, 50, 10, 40, 1.5, 100, 23.1]],
+        "days": [{"date": "2026-01-01", "ti": 100, "to": 50, "tr": 10, "cache": 40}],
+        "activity": [{"date": "2026-01-01", "total": 200}],
+        "records": {"streaks": {"current": 1, "longest": 1}},
+        "agents": [["build", 2, 200]],
+        "projects": [["Demo", 2, 200]],
+        "range": "2026-01-01 to 2026-01-01",
+    }
+
+
+def test_apply_recovered_adjustment_ratio_exact_sum_and_other_row():
+    stats = _recovered_stats()
+    before = json.loads(json.dumps(stats))
+    out = d.apply_recovered_adjustment(stats, 1000)
+    t = out["totals"]
+    # base ratio 100/50/10/30/10 of 200 -> exactly 500/250/50/150/50 of 1000
+    assert t["tokens_input"] == 600
+    assert t["tokens_output"] == 300
+    assert t["tokens_reasoning"] == 60
+    assert t["tokens_cache_read"] == 180
+    assert t["tokens_cache_write"] == 60
+    assert t["tokens_total"] == 1200
+    assert t["cache_rate"] == d.cache_rate(600, 180)
+    assert t["avg_tokens_per_session"] == 300  # 1200 / 4 sessions
+    assert out["recovered"] == {
+        "tokens_total": 1000, "tokens_input": 500, "tokens_output": 250,
+        "tokens_reasoning": 50, "tokens_cache": 200, "model": "Other",
+    }
+    other = [m for m in out["models"] if m[0] == "Other"][0]
+    assert other[1] == 0 and other[2] == 1000
+    assert (other[3], other[4], other[5], other[6]) == (500, 250, 50, 200)
+    assert other[7] == 0 and other[8] == 0
+    assert other[9] == d.cache_rate(500, 200)
+    assert out["models"][0][0] == "Other"  # sorted by total desc
+    # days/activity/records/range/agents/projects are intentionally untouched
+    assert out["days"] == before["days"]
+    assert out["activity"] == before["activity"]
+    assert out["records"] == before["records"]
+    assert out["range"] == before["range"]
+    assert out["agents"] == before["agents"]
+    assert out["projects"] == before["projects"]
+
+
+def test_apply_recovered_adjustment_rounding_and_merging():
+    stats = _recovered_stats()
+    # ratios 3/2/1/1/1 (sum 8) with amount 101: rounding must still sum to 101
+    stats["totals"].update({"tokens_input": 3, "tokens_output": 2,
+                            "tokens_reasoning": 1, "tokens_cache_read": 1,
+                            "tokens_cache_write": 1, "tokens_total": 8})
+    out = d.apply_recovered_adjustment(stats, 101)
+    rec = out["recovered"]
+    parts_sum = (rec["tokens_input"] + rec["tokens_output"] + rec["tokens_reasoning"]
+                 + rec["tokens_cache"])
+    assert parts_sum == 101
+    assert out["totals"]["tokens_total"] == 8 + 101
+    # merging a second call into the same payload adds to the Other row
+    out = d.apply_recovered_adjustment(out, 50)
+    other = [m for m in out["models"] if m[0] == "Other"]
+    assert len(other) == 1
+    assert other[0][2] == 151
+    assert out["recovered"]["tokens_total"] == 50
+
+
+def test_apply_recovered_adjustment_noop_cases():
+    stats = _recovered_stats()
+    assert d.apply_recovered_adjustment(stats, 0) is stats
+    assert "recovered" not in stats
+    assert d.apply_recovered_adjustment(stats, -5) is stats
+    assert d.apply_recovered_adjustment(stats, None) is stats
+    zero = {"totals": dict(d.ZERO_TOTALS), "models": []}
+    assert d.apply_recovered_adjustment(zero, 4_500_000_000) is zero
+    assert "recovered" not in zero
+    assert d.apply_recovered_adjustment(None, 100) is None
+
+
+def test_recovered_tokens_auto_default_db_and_explicit_override(tmp_path, monkeypatch):
+    db = str(tmp_path / "opencode.db")
+    seed_db(db, n_sessions=3)
+    monkeypatch.setattr(d, "DB_PATH", Path(db))
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", None)
+
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    auto = d.cached_local_stats(db)
+    assert auto["recovered"]["tokens_total"] == d.RECOVERED_OPENCODE_TOKENS
+    assert auto["totals"]["tokens_total"] > d.RECOVERED_OPENCODE_TOKENS
+    other = [m for m in auto["models"] if m[0] == "Other"][0]
+    assert other[2] == d.RECOVERED_OPENCODE_TOKENS
+
+    # a different default path -> no auto adjustment
+    monkeypatch.setattr(d, "DB_PATH", Path(tmp_path / "other-default.db"))
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    plain = d.cached_local_stats(db)
+    assert "recovered" not in plain
+    assert all(m[0] != "Other" for m in plain["models"])
+
+    # explicit positive value overrides for any db
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", 5000)
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    overridden = d.cached_local_stats(db)
+    assert overridden["recovered"]["tokens_total"] == 5000
+
+    # 0 disables
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", 0)
+    with d.LOCK:
+        d.LOCAL_CACHE.clear()
+    disabled = d.cached_local_stats(db)
+    assert "recovered" not in disabled
+
+
+def test_recovered_tokens_for_resolution(tmp_path, monkeypatch):
+    default = str(tmp_path / "opencode.db")
+    other = str(tmp_path / "other.db")
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", None)
+    monkeypatch.setattr(d, "DB_PATH", Path(other))
+    assert d.recovered_tokens_for(default) == 0  # auto + non-default path
+    monkeypatch.setattr(d, "DB_PATH", Path(default))
+    assert d.recovered_tokens_for(default) == d.RECOVERED_OPENCODE_TOKENS
+    assert d.recovered_tokens_for(other) == 0
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", 1234)
+    assert d.recovered_tokens_for(other) == 1234
+    monkeypatch.setattr(d, "RECOVERED_TOKENS", 0)
+    assert d.recovered_tokens_for(default) == 0
 
 
 def test_activity_window_is_zero_filled(db_path):

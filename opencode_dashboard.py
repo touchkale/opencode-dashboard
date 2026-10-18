@@ -45,6 +45,8 @@ COMMIT_WINDOW_HOURS = 24  # sessions in this window before a commit count toward
 MAX_COMMITS_PER_REPO = 200  # recent commits scanned per worktree
 MAX_FILE_ROWS = 15  # top files/subsystems kept in the payload (+ implicit Other)
 MAX_COMMIT_ROWS = 60  # commit rows kept in the payload, by tokens desc
+RECOVERED_OPENCODE_TOKENS = 4_500_000_000  # deleted OpenCode history, attributed to "Other"
+RECOVERED_TOKENS = None  # CLI setting: None = auto (default DB only), 0 = off, >0 explicit
 
 
 def connect(db_path):
@@ -862,6 +864,60 @@ def ledger_connect(db_path):
     return con
 
 
+def _prefs_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS prefs (key TEXT PRIMARY KEY, value TEXT)")
+
+
+def ledger_get_pref(db_path, key, default=None):
+    """Read a JSON-encoded preference from the ledger's `prefs` table.
+
+    Any missing/corrupt value (or unreadable ledger) returns `default`, so a
+    bad file can never take the dashboard down.
+    """
+    try:
+        con = ledger_connect(db_path)
+    except Exception:
+        return default
+    try:
+        _prefs_table(con)
+        con.commit()
+        row = con.execute("SELECT value FROM prefs WHERE key = ?", (str(key),)).fetchone()
+        if row is None:
+            return default
+        return json.loads(row["value"])
+    except Exception:
+        return default
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def ledger_set_pref(db_path, key, value):
+    """Persist a JSON-encoded preference in the ledger; True on success."""
+    try:
+        con = ledger_connect(db_path)
+    except Exception:
+        return False
+    try:
+        _prefs_table(con)
+        con.execute(
+            "INSERT INTO prefs(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(key), json.dumps(value)),
+        )
+        con.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def sync_session_ledger(db_path, con):
     """Upsert every session currently in the OpenCode DB into the persistent
     ledger. Sessions that disappear from the source DB are retained (marked
@@ -1286,6 +1342,113 @@ def merge_ledger_into_stats(stats, db_path):
     return stats
 
 
+def recovered_tokens_for(db_path):
+    """Resolve the recovered-token amount for a database path.
+
+    `RECOVERED_TOKENS` None means auto: apply `RECOVERED_OPENCODE_TOKENS`
+    only for the module's default DB_PATH, so tests and other databases stay
+    exact. 0 disables, a positive value overrides for any database.
+    """
+    setting = RECOVERED_TOKENS
+    if setting is None:
+        try:
+            if Path(db_path).resolve() == DB_PATH.resolve():
+                return RECOVERED_OPENCODE_TOKENS
+        except Exception:
+            return 0
+        return 0
+    amount = int(round(num(setting)))
+    return amount if amount > 0 else 0
+
+
+def apply_recovered_adjustment(stats, amount):
+    """Attribute recovered OpenCode tokens to an `Other` model row.
+
+    The amount is distributed across input / output / reasoning / cache-read /
+    cache-write in the same ratio as the live totals, so the recovered history
+    keeps the user's real token mix. Only `totals`, `models` and the
+    `recovered` metadata change: days, activity, records, range, agents and
+    projects are intentionally untouched, so daily charts and records never
+    show the historical recovery as fresh activity.
+    """
+    if not isinstance(stats, dict):
+        return stats
+    amount = int(round(num(amount)))
+    if amount <= 0:
+        return stats
+    totals = stats.get("totals")
+    if not isinstance(totals, dict):
+        return stats
+    buckets = (
+        ("input", num(totals.get("tokens_input"))),
+        ("output", num(totals.get("tokens_output"))),
+        ("reasoning", num(totals.get("tokens_reasoning"))),
+        ("cache_read", num(totals.get("tokens_cache_read"))),
+        ("cache_write", num(totals.get("tokens_cache_write"))),
+    )
+    base_sum = sum(value for _key, value in buckets)
+    if base_sum <= 0:
+        return stats
+    parts = {}
+    allocated = 0
+    for key, value in buckets:
+        share = int(round(amount * value / base_sum))
+        parts[key] = share
+        allocated += share
+    diff = amount - allocated
+    if diff:
+        # rounding leftovers go to the last nonzero bucket so the sum is exact
+        for key, _value in reversed(buckets):
+            if parts[key] > 0:
+                parts[key] += diff
+                break
+        else:
+            parts["input"] += diff
+    cache_total = parts["cache_read"] + parts["cache_write"]
+    totals["tokens_input"] = num(totals.get("tokens_input")) + parts["input"]
+    totals["tokens_output"] = num(totals.get("tokens_output")) + parts["output"]
+    totals["tokens_reasoning"] = num(totals.get("tokens_reasoning")) + parts["reasoning"]
+    totals["tokens_cache_read"] = num(totals.get("tokens_cache_read")) + parts["cache_read"]
+    totals["tokens_cache_write"] = num(totals.get("tokens_cache_write")) + parts["cache_write"]
+    total_tokens = (totals["tokens_input"] + totals["tokens_output"]
+                    + totals["tokens_reasoning"] + totals["tokens_cache_read"]
+                    + totals["tokens_cache_write"])
+    totals["tokens_total"] = total_tokens
+    totals["cache_rate"] = cache_rate(totals["tokens_input"], totals["tokens_cache_read"])
+    sessions = num(totals.get("sessions"))
+    totals["avg_tokens_per_session"] = round(total_tokens / sessions, 0) if sessions else 0
+
+    models = stats.get("models")
+    if not isinstance(models, list):
+        models = []
+        stats["models"] = models
+    for row in models:
+        if isinstance(row, list) and len(row) >= 10 and str(row[0]) == "Other":
+            row[2] = num(row[2]) + amount
+            row[3] = num(row[3]) + parts["input"]
+            row[4] = num(row[4]) + parts["output"]
+            row[5] = num(row[5]) + parts["reasoning"]
+            row[6] = num(row[6]) + cache_total
+            row[9] = cache_rate(row[3], row[6])
+            break
+    else:
+        models.append(
+            ["Other", 0, amount, parts["input"], parts["output"], parts["reasoning"],
+             cache_total, 0, 0, cache_rate(parts["input"], cache_total)]
+        )
+    models.sort(key=lambda r: -num(r[2]) if isinstance(r, (list, tuple)) and len(r) > 2 else 0)
+
+    stats["recovered"] = {
+        "tokens_total": amount,
+        "tokens_input": parts["input"],
+        "tokens_output": parts["output"],
+        "tokens_reasoning": parts["reasoning"],
+        "tokens_cache": cache_total,
+        "model": "Other",
+    }
+    return stats
+
+
 def cached_local_stats(db_path):
     path = Path(db_path)
     try:
@@ -1295,8 +1458,10 @@ def cached_local_stats(db_path):
             f"Database not found: {db_path}\nRun OpenCode at least once to create it."
         ) from None
     # Git HEADs join the fingerprint so fresh commits refresh the per-commit
-    # panel even when the database itself is untouched.
-    fingerprint = (_fingerprint_paths([path]), repo_heads(db_worktrees(db_path)))
+    # panel even when the database itself is untouched; the recovered-token
+    # setting joins too so changing it invalidates cached stats.
+    fingerprint = (_fingerprint_paths([path]), repo_heads(db_worktrees(db_path)),
+                   recovered_tokens_for(db_path))
     with LOCK:
         if LOCAL_CACHE.get("key") == fingerprint and LOCAL_CACHE.get("stats") is not None:
             return LOCAL_CACHE["stats"]
@@ -1308,6 +1473,12 @@ def cached_local_stats(db_path):
         con.close()
     try:
         stats = merge_ledger_into_stats(stats, db_path)
+    except Exception:
+        pass
+    try:
+        amount = recovered_tokens_for(db_path)
+        if amount:
+            stats = apply_recovered_adjustment(stats, amount)
     except Exception:
         pass
     with LOCK:
@@ -4785,11 +4956,11 @@ def tui_layout(w, h):
     if w >= 110 and h >= 30:
         layout["mode"] = "wide"
         layout["card_h"] = 6
-        n_cards = 4
+        n_cards = 5  # Today + 4 range/context cards
     elif w >= 84 and h >= 26:
         layout["mode"] = "medium"
         layout["card_h"] = 6
-        n_cards = 3
+        n_cards = 4  # Today + 3 range/context cards
     else:
         layout["mode"] = "narrow"
         layout["card_h"] = 4
@@ -5014,10 +5185,15 @@ def tui_model_badge(model_row, cost_idx=7):
     `cost_idx` is 7 for OpenCode rows (actual session cost) and 12 for
     Codex/Cline rows (Codex: what-if paid cost; Cline: 0, it records no
     per-model cost). Index 11 is the free flag when the payload has one.
+
+    The synthetic recovered-history row named `Other` never gets a free/$0
+    badge: it is recovered usage, not a free model.
     """
     if not isinstance(model_row, (list, tuple)) or not model_row:
         return ""
     name = str(model_row[0] or "")
+    if name.strip().lower() == "other":
+        return ""
     cost = num(model_row[cost_idx]) if len(model_row) > cost_idx else 0.0
     free_flag = bool(model_row[11]) if len(model_row) > 11 else False
     if "free" in name.lower() or free_flag:
@@ -5025,6 +5201,13 @@ def tui_model_badge(model_row, cost_idx=7):
     if cost <= 0:
         return "$0"
     return ""
+
+
+def tui_recovered_badge(model_row):
+    """'recovered' for the synthetic `Other` model row, '' otherwise."""
+    if not isinstance(model_row, (list, tuple)) or not model_row:
+        return ""
+    return "recovered" if str(model_row[0] or "").strip().lower() == "other" else ""
 
 
 def tui_fmt_cost(value):
@@ -5050,9 +5233,77 @@ def tui_free_model_count(models, cost_idx=7):
     return n
 
 
+TUI_HARNESS_KEYS = ("opencode", "router", "cline")
+TUI_HARNESS_NAMES = ("OpenCode", "Codex", "Cline")
+
+
+def tui_today_totals(stats):
+    """Tokens consumed today (local date) from a stats payload's day rows.
+
+    Always reads the row whose date is today's local date, so it is independent
+    of the `t` range toggle. Missing payloads/days return zeros.
+    """
+    today = datetime.now().date().isoformat()
+    out = {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "tokens_total": 0.0,
+           "sessions": 0, "messages": 0, "found": False}
+    for d in (stats or {}).get("days") or []:
+        if not isinstance(d, dict) or str(d.get("date") or "") != today:
+            continue
+        out["ti"] = num(d.get("ti"))
+        out["to"] = num(d.get("to"))
+        out["tr"] = num(d.get("tr"))
+        out["cache"] = num(d.get("cache"))
+        out["tokens_total"] = out["ti"] + out["to"] + out["tr"] + out["cache"]
+        out["sessions"] = int(num(d.get("sessions")))
+        out["messages"] = int(num(d.get("msgs")))
+        out["found"] = True
+        break
+    return out
+
+
+def tui_harness_visibility(value):
+    """Normalize a stored harness_visibility value to {key: bool}.
+
+    Missing keys default to visible; corrupt values and an all-hidden map fall
+    back to everything visible, so a bad ledger can never blank the TUI.
+    """
+    out = {key: True for key in TUI_HARNESS_KEYS}
+    data = value
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (TypeError, ValueError):
+            data = None
+    if isinstance(data, dict):
+        for key in TUI_HARNESS_KEYS:
+            if key in data:
+                out[key] = bool(data[key])
+    if not any(out.values()):
+        return {key: True for key in TUI_HARNESS_KEYS}
+    return out
+
+
+def tui_tab_order(visible):
+    """Tab indices to cycle through: visible harness tabs, then Recap (3)."""
+    vis = tui_harness_visibility(visible)
+    return [i for i, key in enumerate(TUI_HARNESS_KEYS) if vis[key]] + [3]
+
+
+def tui_next_tab(tab, delta, visible):
+    """Next tab index in the visible order (wraps); first visible when hidden."""
+    order = tui_tab_order(visible)
+    if tab not in order:
+        return order[0]
+    return order[(order.index(tab) + delta) % len(order)]
+
+
 def run_tui(args):
     import curses
     import locale
+
+    global RECOVERED_TOKENS
+    if hasattr(args, "recovered_tokens"):
+        RECOVERED_TOKENS = args.recovered_tokens
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
@@ -5118,15 +5369,65 @@ def run_tui(args):
         }
 
     G = _init_glyphs()
+
+    def load_harness_visibility():
+        """Ledger-stored harness visibility, defaulting to all visible."""
+        default = {key: True for key in TUI_HARNESS_KEYS}
+        try:
+            if not Path(args.db).exists():
+                return default
+            return tui_harness_visibility(ledger_get_pref(args.db, "harness_visibility"))
+        except Exception:
+            return default
+
     state = {
         "tab": 0, "S": None, "R": None, "C": None,
-        "msg": "", "last": 0.0, "url": url,
+        "msg": "", "status": "", "last": 0.0, "url": url,
         "sel": [0, 0, 0, 0],
         "modal": None, "filter": "", "search": None,
         "range_idx": 1, "loading": False, "spinner": 0,
+        "visible": load_harness_visibility(),
     }
     tabs = ["OpenCode", "Codex", "Cline", "Recap"]
     render = {"pal": None}
+
+    def visible_order():
+        return tui_tab_order(state["visible"])
+
+    def ensure_visible_tab():
+        order = visible_order()
+        if state["tab"] not in order:
+            state["tab"] = order[0]
+
+    ensure_visible_tab()
+
+    def save_harness_visibility():
+        try:
+            ledger_set_pref(
+                args.db, "harness_visibility",
+                {key: bool(state["visible"].get(key, True)) for key in TUI_HARNESS_KEYS},
+            )
+        except Exception:
+            pass
+
+    def toggle_harness(idx):
+        if idx < 0 or idx >= len(TUI_HARNESS_KEYS):
+            return
+        key = TUI_HARNESS_KEYS[idx]
+        visible = dict(state["visible"])
+        shown = sum(1 for k in TUI_HARNESS_KEYS if visible.get(k, True))
+        if visible.get(key, True) and shown <= 1:
+            state["status"] = "keep one harness visible"
+            return
+        visible[key] = not visible.get(key, True)
+        state["visible"] = visible
+        save_harness_visibility()
+        ensure_visible_tab()
+        state["status"] = (f"{TUI_HARNESS_NAMES[idx]} "
+                           f"{'shown' if visible[key] else 'hidden'} (saved)")
+
+    def tab_step(delta):
+        state["tab"] = tui_next_tab(state["tab"], delta, state["visible"])
 
     def clear_caches():
         with LOCK:
@@ -5150,6 +5451,7 @@ def run_tui(args):
         except Exception:
             state["C"] = None
         state["last"] = time.time()
+        state["status"] = ""
         if state["url"]:
             state["msg"] = "updated " + datetime.now().strftime("%H:%M:%S")
         else:
@@ -5256,7 +5558,18 @@ def run_tui(args):
             streaks = rec.get("streaks") or {}
             big = rec.get("biggest_day") or {}
             free_n = tui_free_model_count(S.get("models"))
+            today = tui_today_totals(S)
             return [
+                {
+                    "title": "Today",
+                    "value": _fmt(today["tokens_total"]),
+                    "value_attr": pal["mag"] | BOLD,
+                    "details": [
+                        ("7d", _fmt(tui_period_totals(S, 7)["tokens_total"])),
+                        ("30d", _fmt(tui_period_totals(S, 30)["tokens_total"])),
+                        ("sessions", str(today["sessions"])),
+                    ],
+                },
                 {
                     "title": "Tokens",
                     "value": _fmt(p["tokens_total"]),
@@ -5307,7 +5620,18 @@ def run_tui(args):
                 return [_no_data_card("Codex", pal)]
             p = tui_period_totals(R, days)
             top = (R.get("models") or [None])[0]
+            today = tui_today_totals(R)
             return [
+                {
+                    "title": "Today",
+                    "value": _fmt(today["tokens_total"]),
+                    "value_attr": pal["mag"] | BOLD,
+                    "details": [
+                        ("7d", _fmt(tui_period_totals(R, 7)["tokens_total"])),
+                        ("30d", _fmt(tui_period_totals(R, 30)["tokens_total"])),
+                        ("requests", str(today["messages"])),
+                    ],
+                },
                 {
                     "title": "Requests",
                     "value": str(p["messages"]),
@@ -5354,7 +5678,18 @@ def run_tui(args):
         if not C:
             return [_no_data_card("Cline", pal)]
         p = tui_period_totals(C, days)
+        today = tui_today_totals(C)
         return [
+            {
+                "title": "Today",
+                "value": _fmt(today["tokens_total"]),
+                "value_attr": pal["mag"] | BOLD,
+                "details": [
+                    ("7d", _fmt(tui_period_totals(C, 7)["tokens_total"])),
+                    ("30d", _fmt(tui_period_totals(C, 30)["tokens_total"])),
+                    ("messages", str(today["messages"])),
+                ],
+            },
             {
                 "title": "Requests",
                 "value": str(p["messages"]),
@@ -5427,8 +5762,10 @@ def run_tui(args):
             for label, value in card.get("details", []):
                 if yy > y + hh - 2:
                     break
-                lab = tui_fit(str(label), max(1, iw - 10), G["ell"])
-                val = tui_fit(str(value), max(4, iw // 2 + 2), G["ell"])
+                # size the value first, then fit the label into what is left so
+                # a long value can never collide with its label
+                val = tui_fit(str(value), max(4, iw - 6), G["ell"])
+                lab = tui_fit(str(label), max(1, iw - len(val) - 1), G["ell"])
                 put(win, yy, ix, lab, pal["muted"])
                 put(win, yy, ix + max(0, iw - len(val)), val, pal["dim"] | curses.A_BOLD)
                 yy += 1
@@ -5487,6 +5824,14 @@ def run_tui(args):
             put(win, labels_y, ix + max(0, iw - len(dates[-1])), dates[-1], pal["muted"])
 
     # ---------------------------------------------------------------- models
+    def model_badge_attr(badge, pal):
+        """Badge colour: `recovered` is an accent/warn marker, free/$0 are good."""
+        if badge == "recovered":
+            return pal["warn"] | curses.A_BOLD
+        if badge == "free":
+            return pal["good"] | curses.A_BOLD
+        return pal["good"]
+
     def draw_models(win, rect, models, pal, cost_idx=7):
         """Top models table; `cost_idx` is 7 for OpenCode and 12 for Codex/Cline."""
         y, x, hh, ww = rect
@@ -5502,11 +5847,13 @@ def run_tui(args):
             return
         vmax = max(num(m[2]) for m in rows) or 1.0
         show_cost = iw >= 40
+        # the recovered "Other" row needs a wider badge cell than free/$0
+        badge_w = 9 if any(tui_recovered_badge(m) for m in rows) else 5
         if show_cost:
-            tail_w = 7 + 2 + 7 + 2 + 5
+            tail_w = 7 + 2 + 7 + 2 + badge_w
         else:
-            # narrow models panel: keep tokens + the free/$0 badge, drop cost
-            tail_w = 7 + 2 + 5
+            # narrow models panel: keep tokens + the badge, drop cost
+            tail_w = 7 + 2 + badge_w
         tail_x = ix + max(0, iw - tail_w)
         name_space = max(6, tail_x - ix - 1)
         bar_w = min(16, max(0, name_space - 16))
@@ -5524,7 +5871,7 @@ def run_tui(args):
             name = str(m[0])
             tot = num(m[2])
             cost = num(m[cost_idx]) if len(m) > cost_idx else 0.0
-            badge = tui_model_badge(m, cost_idx)
+            badge = tui_model_badge(m, cost_idx) or tui_recovered_badge(m)
             put(win, yy, ix, tui_fit(name, name_w, G["ell"]),
                 pal["value"] if i == 0 else pal["dim"])
             if bar_w > 0:
@@ -5537,13 +5884,13 @@ def run_tui(args):
                 num_txt = f"{_fmt(tot):>7}  {tui_fit(tui_fmt_cost(cost), 7):>7}  "
                 put(win, yy, tail_x, num_txt, pal["muted"])
                 if badge:
-                    attr = pal["good"] | curses.A_BOLD if badge == "free" else pal["good"]
-                    put(win, yy, tail_x + len(num_txt), f"{badge:<5}", attr)
+                    put(win, yy, tail_x + len(num_txt), f"{badge:<{badge_w}}",
+                        model_badge_attr(badge, pal))
             else:
                 put(win, yy, tail_x, f"{_fmt(tot):>7}  ", pal["dim"] | curses.A_BOLD)
                 if badge:
-                    attr = pal["good"] | curses.A_BOLD if badge == "free" else pal["good"]
-                    put(win, yy, tail_x + 9, f"{badge:<5}", attr)
+                    put(win, yy, tail_x + 9, f"{badge:<{badge_w}}",
+                        model_badge_attr(badge, pal))
 
     # --------------------------------------------------------------- heatmap
     def draw_heatmap(win, y, x, iw, hh, activity, pal):
@@ -5796,42 +6143,56 @@ def run_tui(args):
 
     # ---------------------------------------------------------------- recap
     def draw_recap(win, y, x, hh, ww, pal):
-        box(win, (y, x, hh, ww), f"Recap {G['mid']} all harnesses", pal["border"],
-            pal["acc"] | curses.A_BOLD)
+        vis = state["visible"]
+        shown_count = sum(1 for key in TUI_HARNESS_KEYS if vis.get(key, True))
+        title = (f"Recap {G['mid']} all harnesses" if shown_count == 3
+                 else f"Recap {G['mid']} {shown_count} of 3 harnesses")
+        box(win, (y, x, hh, ww), title, pal["border"], pal["acc"] | curses.A_BOLD)
         iw = ww - 4
         if iw < 10 or hh < 4:
             return
         ix = x + 2
         days = TUI_RANGES[state["range_idx"]][1]
         rng = TUI_RANGES[state["range_idx"]][0]
-        ps = tui_period_totals(state["S"], days) if state["S"] else None
-        pr = tui_period_totals(state["R"], days) if state["R"] else None
-        pc = tui_period_totals(state["C"], days) if state["C"] else None
-        oc = ps["tokens_total"] if ps else 0.0
-        rx = pr["tokens_total"] if pr else 0.0
-        cn = pc["tokens_total"] if pc else 0.0
-        total = oc + rx + cn
+        entries = [
+            ("OpenCode", "opencode",
+             tui_period_totals(state["S"], days) if state["S"] else None, "acc"),
+            ("Codex", "router",
+             tui_period_totals(state["R"], days) if state["R"] else None, "acc2"),
+            ("Cline", "cline",
+             tui_period_totals(state["C"], days) if state["C"] else None, "mag"),
+        ]
+        shown = [e for e in entries if vis.get(e[1], True)]
+        total = sum((e[2]["tokens_total"] if e[2] else 0.0) for e in shown)
+        today_total = sum(
+            tui_today_totals(state["S"] if e[1] == "opencode" else
+                             state["R"] if e[1] == "router" else state["C"])["tokens_total"]
+            for e in shown
+        )
         put(win, y + 1, ix, f"TOTAL {_fmt(total)}", pal["mag"] | curses.A_BOLD)
-        put(win, y + 1, ix + 24, f"range {rng}   today {_fmt(tui_period_totals(state['S'], 1)['tokens_total'] + tui_period_totals(state['R'], 1)['tokens_total'] + tui_period_totals(state['C'], 1)['tokens_total'])}",
-            pal["muted"])
-        put(win, y + 2, ix, f"OpenCode {_fmt(oc)}   Codex {_fmt(rx)}   Cline {_fmt(cn)}", pal["dim"])
+        put(win, y + 1, ix + 24, f"range {rng}   today {_fmt(today_total)}", pal["muted"])
+        put(win, y + 2, ix,
+            "   ".join(f"{e[0]} {_fmt(e[2]['tokens_total'] if e[2] else 0)}" for e in shown),
+            pal["dim"])
         by = y + 4
         denom = total or 1.0
         bx = ix
-        for value, key in ((oc, "acc"), (rx, "acc2"), (cn, "mag")):
+        for e in shown:
+            value = e[2]["tokens_total"] if e[2] else 0.0
             seg = int(round(value / denom * iw))
             if seg > 0 and bx < ix + iw:
                 seg = min(seg, ix + iw - bx)
-                put(win, by, bx, G["bar"] * seg, pal[key])
+                put(win, by, bx, G["bar"] * seg, pal[e[3]])
                 bx += seg
         put(win, by + 1, ix,
-            f"{pct(oc, total):.0f}% OpenCode {G['mid']} {pct(rx, total):.0f}% Codex {G['mid']} {pct(cn, total):.0f}% Cline",
+            f" {G['mid']} ".join(
+                f"{pct(e[2]['tokens_total'] if e[2] else 0, total):.0f}% {e[0]}" for e in shown),
             pal["muted"])
         yy = by + 3
-        for label, p, key in (("OpenCode", ps, "acc"), ("Codex", pr, "acc2"), ("Cline", pc, "mag")):
+        for name, _key, p, attr_key in shown:
             if yy > y + hh - 2:
                 break
-            put(win, yy, ix, f"{label:<9}", pal[key] | curses.A_BOLD)
+            put(win, yy, ix, f"{name:<9}", pal[attr_key] | curses.A_BOLD)
             if p:
                 put(win, yy, ix + 10,
                     f"{_fmt(p['tokens_total']):>9}   {p['messages']:>6} req   {p['sessions']:>5} sessions",
@@ -5859,15 +6220,25 @@ def run_tui(args):
             # tiny terminal: plain summary lines, no borders
             p = period(payload)
             if tab == 3:
-                oc = period(state["S"])["tokens_total"]
-                rx = period(state["R"])["tokens_total"]
-                cn = period(state["C"])["tokens_total"]
-                lines = [("TOTAL", _fmt(oc + rx + cn), "mag"),
-                         ("OpenCode", _fmt(oc), "acc"),
-                         ("Codex", _fmt(rx), "acc2"),
-                         ("Cline", _fmt(cn), "mag")]
+                vis = state["visible"]
+                oc = period(state["S"])["tokens_total"] if vis.get("opencode", True) else 0.0
+                rx = period(state["R"])["tokens_total"] if vis.get("router", True) else 0.0
+                cn = period(state["C"])["tokens_total"] if vis.get("cline", True) else 0.0
+                today = sum(
+                    tui_today_totals(src)["tokens_total"]
+                    for key, src in (("opencode", state["S"]), ("router", state["R"]),
+                                     ("cline", state["C"])) if vis.get(key, True))
+                lines = [("TOTAL", _fmt(oc + rx + cn), "mag")]
+                if vis.get("opencode", True):
+                    lines.append(("OpenCode", _fmt(oc), "acc"))
+                if vis.get("router", True):
+                    lines.append(("Codex", _fmt(rx), "acc2"))
+                if vis.get("cline", True):
+                    lines.append(("Cline", _fmt(cn), "mag"))
+                lines.append(("Today", _fmt(today), "mag"))
             else:
-                lines = [("Tokens", _fmt(p["tokens_total"]), "acc"),
+                lines = [("Today", _fmt(tui_today_totals(payload)["tokens_total"]), "mag"),
+                         ("Tokens", _fmt(p["tokens_total"]), "acc"),
                          ("Sessions", str(p["sessions"]), "value"),
                          ("Messages", str(p["messages"]), "value"),
                          ("Cost", tui_fmt_cost(p["cost"]), "good")]
@@ -5922,55 +6293,64 @@ def run_tui(args):
             if not rows:
                 return
             m = rows[0]
-            badge = tui_model_badge(m, 12 if tab in (1, 2) else 7)
+            badge = (tui_model_badge(m, 12 if tab in (1, 2) else 7)
+                     or tui_recovered_badge(m))
             put(win, yy, ix, "top model", pal["muted"])
             room = iw - 11 - (len(badge) + 1 if badge else 0)
             put(win, yy, ix + 10, tui_fit(str(m[0]), max(6, room), G["ell"]), pal["dim"])
             if badge:
-                put(win, yy, ix + iw - len(badge), badge, pal["good"] | curses.A_BOLD)
+                put(win, yy, ix + iw - len(badge), badge,
+                    model_badge_attr(badge, pal))
 
         if tab == 3:
-            oc = period(state["S"])["tokens_total"]
-            rx = period(state["R"])["tokens_total"]
-            cn = period(state["C"])["tokens_total"]
-            total = oc + rx + cn
+            vis = state["visible"]
+            sources = [("OpenCode", "opencode", state["S"], "acc"),
+                       ("Codex", "router", state["R"], "acc2"),
+                       ("Cline", "cline", state["C"], "mag")]
+            shown = [e for e in sources if vis.get(e[1], True)]
+            total = sum(period(e[2])["tokens_total"] for e in shown)
+            today = sum(tui_today_totals(e[2])["tokens_total"] for e in shown)
             put(win, y + 1, ix, _fmt(total), pal["mag"] | curses.A_BOLD)
             denom = total or 1.0
             bx = ix
-            for value, key in ((oc, "acc"), (rx, "acc2"), (cn, "mag")):
-                seg = int(round(value / denom * iw))
+            for _name, _key, src, attr_key in shown:
+                seg = int(round(period(src)["tokens_total"] / denom * iw))
                 if seg > 0 and bx < ix + iw:
                     seg = min(seg, ix + iw - bx)
-                    put(win, y + 2, bx, G["bar"] * seg, pal[key])
+                    put(win, y + 2, bx, G["bar"] * seg, pal[attr_key])
                     bx += seg
-            kv(y + 3, "OpenCode", _fmt(oc), pal["acc"] | curses.A_BOLD)
-            kv(y + 4, "Codex", _fmt(rx), pal["acc2"] | curses.A_BOLD)
-            kv(y + 5, "Cline", _fmt(cn), pal["mag"] | curses.A_BOLD)
+            yy = y + 3
+            for name, _key, src, attr_key in shown:
+                kv(yy, name, _fmt(period(src)["tokens_total"]), pal[attr_key] | curses.A_BOLD)
+                yy += 1
+            kv(yy, "today", _fmt(today), pal["mag"] | curses.A_BOLD)
             return
 
         p = period(payload)
+        today = tui_today_totals(payload)
         put(win, y + 1, ix, _fmt(p["tokens_total"]), pal["acc"] | curses.A_BOLD)
         sec = f"{p['messages']} requests" if tab == 1 else f"{p['sessions']} sessions"
         put(win, y + 1, ix + max(0, iw - len(sec)), tui_fit(sec, iw // 2), pal["muted"])
         spark(y + 2, payload)
         yy = y + 3
+        kv(yy, "today", _fmt(today["tokens_total"]), pal["mag"] | curses.A_BOLD)
         if tab == 0:
-            kv(yy, "input", _fmt(p["ti"]))
-            kv(yy + 1, "output", _fmt(p["to"]))
-            kv(yy + 2, "cache", _fmt(p["cache"]))
-            kv(yy + 3, "cost", tui_fmt_cost(p["cost"]))
-            top_model(yy + 4, (payload or {}).get("models"))
+            kv(yy + 1, "input", _fmt(p["ti"]))
+            kv(yy + 2, "output", _fmt(p["to"]))
+            kv(yy + 3, "cache", _fmt(p["cache"]))
+            kv(yy + 4, "cost", tui_fmt_cost(p["cost"]))
+            top_model(yy + 5, (payload or {}).get("models"))
         elif tab == 1:
-            kv(yy, "ok", str(p["ok"]))
-            kv(yy + 1, "errors", str(p["err"]))
-            kv(yy + 2, "429s", str(p["err429"]))
-            kv(yy + 3, "what-if", tui_fmt_cost(p["what_if"]))
-            top_model(yy + 4, (payload or {}).get("models"))
+            kv(yy + 1, "ok", str(p["ok"]))
+            kv(yy + 2, "errors", str(p["err"]))
+            kv(yy + 3, "429s", str(p["err429"]))
+            kv(yy + 4, "what-if", tui_fmt_cost(p["what_if"]))
+            top_model(yy + 5, (payload or {}).get("models"))
         else:
-            kv(yy, "requests", str(p["messages"]))
-            kv(yy + 1, "sessions", str(p["sessions"]))
-            kv(yy + 2, "cache", _fmt(p["cache"]))
-            top_model(yy + 3, (payload or {}).get("models"))
+            kv(yy + 1, "requests", str(p["messages"]))
+            kv(yy + 2, "sessions", str(p["sessions"]))
+            kv(yy + 3, "cache", _fmt(p["cache"]))
+            top_model(yy + 4, (payload or {}).get("models"))
 
     # ---------------------------------------------------------------- lists
     def filtered_rows(tab):
@@ -6070,6 +6450,7 @@ def run_tui(args):
             ("enter", "open the detail modal"),
             ("/ then enter", "filter sessions (esc cancels)"),
             ("t", "cycle range 14d / 30d / 90d / all"),
+            ("h", "show/hide harnesses (saved to the ledger)"),
             ("?", "this help"),
             ("esc", "close modal / clear filter"),
         ]
@@ -6120,6 +6501,39 @@ def run_tui(args):
             hint = (f"esc close {G['mid']} j/k scroll {G['mid']} "
                     f"{scroll + 1}-{min(scroll + visible, len(wrapped))}/{len(wrapped)}")
         put(stdscr, my + mh - 2, mx + 2, tui_fit(hint, iw), pal["muted"])
+
+    def draw_harness_modal(stdscr, pal):
+        """Centered harness visibility modal with [x]/[ ] checkboxes."""
+        m = state["modal"]
+        h, w = stdscr.getmaxyx()
+        if w < 30 or h < 8:
+            return
+        mw = min(46, max(30, w - 8))
+        mh = 8
+        my = max(0, (h - mh) // 2)
+        mx = max(0, (w - mw) // 2)
+        iw = mw - 4
+        fill(stdscr, my + 1, mx + 1, mh - 2, mw - 2, 0)
+        box(stdscr, (my, mx, mh, mw), m.get("title", "Harnesses"),
+            pal["acc"] | curses.A_BOLD, pal["acc"] | curses.A_BOLD)
+        sel = int(m.get("sel") or 0) % len(TUI_HARNESS_KEYS)
+        for i, name in enumerate(TUI_HARNESS_NAMES):
+            row = my + 1 + i
+            if row > my + mh - 2:
+                break
+            shown = state["visible"].get(TUI_HARNESS_KEYS[i], True)
+            mark = f"[{'x' if shown else ' '}]"
+            cursor = G["arrow"] + " " if i == sel else "  "
+            attr = (pal["value"] | curses.A_BOLD) if i == sel else pal["dim"]
+            if not shown:
+                attr = pal["muted"]
+            put(stdscr, row, mx + 2, tui_fit(cursor + f"{mark} {name}", iw), attr)
+        if my + 5 <= my + mh - 2:
+            put(stdscr, my + 5, mx + 2,
+                tui_fit("space/enter toggle   h/esc close", iw), pal["muted"])
+        if my + 6 <= my + mh - 2:
+            put(stdscr, my + 6, mx + 2,
+                tui_fit("hidden harnesses leave Recap totals", iw), pal["muted"])
 
     # ------------------------------------------------------------ page bodies
     def draw_body(win, layout, tab, pal):
@@ -6176,7 +6590,7 @@ def run_tui(args):
 
         layout = tui_layout(w, h)
         state["mode"] = layout["mode"]
-        # tab bar
+        # tab bar (hidden harnesses stay in place but dimmed)
         short = layout["mode"] == "compact" or w < 64
         labels = ["OC", "CX", "CL", "RC"] if short else tabs
         x = 1
@@ -6184,7 +6598,13 @@ def run_tui(args):
             text = f" {i + 1}{name} " if short else f" {i + 1} {name} "
             if x + len(text) > w - 1:
                 break
-            attr = pal["tab"] | BOLD if i == tab else pal["muted"]
+            hidden = i < 3 and not state["visible"].get(TUI_HARNESS_KEYS[i], True)
+            if i == tab:
+                attr = pal["tab"] | BOLD
+            elif hidden:
+                attr = pal["muted"] | curses.A_DIM
+            else:
+                attr = pal["muted"]
             put(stdscr, 1, x, text, attr)
             x += len(text) + 1
         tabs_end = x
@@ -6193,15 +6613,24 @@ def run_tui(args):
         live = f"{G['dot']} live"
         live_x = max(1, w - len(live) - 1)
         right_x = live_x - len(right) - 3
+        harness_shown = False
         if w >= 48 and right_x >= tabs_end + 2:
             put(stdscr, 1, right_x, right, pal["dim"])
             if live_x >= right_x + len(right) + 2:
                 put(stdscr, 1, live_x, live, pal["good"] | BOLD)
         elif w >= 20 and live_x >= tabs_end + 2:
             put(stdscr, 1, live_x, live, pal["good"] | BOLD)
+        hidden_count = sum(1 for key in TUI_HARNESS_KEYS if not state["visible"].get(key, True))
+        harness_txt = ""
+        if hidden_count and w >= 48:
+            harness_txt = f"harness {3 - hidden_count}/3"
+            harness_x = right_x - len(harness_txt) - 3
+            if harness_x >= tabs_end + 2:
+                put(stdscr, 1, harness_x, harness_txt, pal["warn"])
+                harness_shown = True
         if state.get("filter") and w >= 48:
             tag = f"filter:{tui_fit(state['filter'], 12, G['ell'])}"
-            tag_x = right_x - len(tag) - 2
+            tag_x = right_x - len(tag) - 2 - (len(harness_txt) + 3 if harness_shown else 0)
             if tag_x >= tabs_end + 2:
                 put(stdscr, 1, tag_x, tag, pal["warn"])
 
@@ -6216,16 +6645,31 @@ def run_tui(args):
 
         # footer
         put(stdscr, h - 2, 0, G["h"] * max(0, w - 1), pal["muted"])
-        parts = ["q quit", "r refresh", "o web UI", "t range", "/ search", "? help"]
+        parts = ["q quit", "r refresh", "o web UI", "t range", "/ search", "? help",
+                 "h harness"]
         if w >= 100:
             parts[2] = f"o {state['url']}" if state["url"] else "o web UI off"
         elif w < 80:
             # 70-79 cols: the full hint list does not fit on one line
-            parts = ["q quit", "r refresh", "t range", "/ search", "? help"]
+            parts = ["q quit", "r refresh", "t range", "/ search", "? help", "h harness"]
         if w < 36:
-            parts = ["q quit", "? help"]
+            parts = ["q quit", "? help", "h harness"]
         elif w < 64:
-            parts = ["q quit", "r refresh", "? help"]
+            parts = ["q quit", "r refresh", "? help", "h harness"]
+        while "h harness" in parts and len(" " + G["sep"].join(parts) + " ") > w - 1:
+            parts.remove("h harness")
+        if hidden_count and not harness_shown:
+            n_vis = 3 - hidden_count
+            for tag in (f"harness {n_vis}/3", f"h {n_vis}/3"):
+                if len(" " + G["sep"].join(parts + [tag]) + " ") <= w - 1:
+                    parts.append(tag)
+                    break
+            else:
+                parts = [p for p in parts if p != "h harness"]
+                for tag in (f"harness {n_vis}/3", f"h {n_vis}/3"):
+                    if len(" " + G["sep"].join(parts + [tag]) + " ") <= w - 1:
+                        parts.append(tag)
+                        break
         hints = " " + G["sep"].join(parts) + " "
         msg = state.get("msg") or ""
         searching = state.get("search") is not None
@@ -6236,6 +6680,9 @@ def run_tui(args):
             spin = G["spin"][state["spinner"] % len(G["spin"])]
             msg = f"{spin} refreshing…"
             attr = pal["acc"]
+        elif state.get("status"):
+            msg = tui_fit(state["status"], max(4, w - 2), G["ell"])
+            attr = pal["warn"]
         elif state.get("filter"):
             msg = f"filter: {tui_fit(state['filter'], 18, G['ell'])} {G['mid']} esc clears"
             attr = pal["warn"]
@@ -6255,7 +6702,10 @@ def run_tui(args):
             put(stdscr, h - 1, 0, hints, pal["muted"])
 
         if state["modal"] is not None:
-            draw_modal(stdscr, pal)
+            if state["modal"].get("kind") == "harness":
+                draw_harness_modal(stdscr, pal)
+            else:
+                draw_modal(stdscr, pal)
         stdscr.refresh()
 
     def draw_loading(stdscr):
@@ -6399,6 +6849,16 @@ def run_tui(args):
                 continue
             if state["modal"] is not None:
                 m = state["modal"]
+                if m.get("kind") == "harness":
+                    if key == 27 or key in (ord("h"), ord("H"), ord("q"), ord("Q")):
+                        state["modal"] = None
+                    elif key in (curses.KEY_UP, ord("k")):
+                        m["sel"] = (int(m.get("sel") or 0) - 1) % len(TUI_HARNESS_KEYS)
+                    elif key in (curses.KEY_DOWN, ord("j")):
+                        m["sel"] = (int(m.get("sel") or 0) + 1) % len(TUI_HARNESS_KEYS)
+                    elif key in (ord(" "), 10, 13, curses.KEY_ENTER):
+                        toggle_harness(int(m.get("sel") or 0))
+                    continue
                 if key == 27 or key in (ord("q"), ord("Q")):
                     state["modal"] = None
                 elif key in (curses.KEY_UP, ord("k")):
@@ -6429,14 +6889,21 @@ def run_tui(args):
                 cycle_range()
             elif key == ord("?"):
                 state["modal"] = help_modal()
+            elif key in (ord("h"), ord("H")):
+                state["modal"] = {"kind": "harness", "title": "Harnesses",
+                                  "sel": 0, "scroll": 0, "lines": []}
             elif key == ord("/"):
                 state["search"] = ""
             elif key in (9, curses.KEY_RIGHT):
-                state["tab"] = (state["tab"] + 1) % len(tabs)
+                tab_step(1)
             elif key == curses.KEY_LEFT:
-                state["tab"] = (state["tab"] - 1) % len(tabs)
+                tab_step(-1)
             elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
-                state["tab"] = key - ord("1")
+                idx = key - ord("1")
+                if idx in visible_order():
+                    state["tab"] = idx
+                else:
+                    state["status"] = f"{tabs[idx]} is hidden — press h to show it"
             elif key in (curses.KEY_UP, ord("k")):
                 move_sel(-1)
             elif key in (curses.KEY_DOWN, ord("j")):
@@ -6483,7 +6950,15 @@ def main():
                         help="path to Codex Router rate-limits.json")
     parser.add_argument("--cline-dir", default=str(CLINE_DIR_DEFAULT),
                         help="path to Cline Desktop data dir (sessions + db)")
+    parser.add_argument(
+        "--recovered-tokens", type=int, default=None, metavar="N",
+        help=(f"recovered OpenCode tokens to attribute to an 'Other' model row "
+              f"(default {RECOVERED_OPENCODE_TOKENS:,} for the default db; 0 disables)"),
+    )
     args = parser.parse_args()
+
+    global RECOVERED_TOKENS
+    RECOVERED_TOKENS = args.recovered_tokens
 
     if args.tui:
         run_tui(args)
