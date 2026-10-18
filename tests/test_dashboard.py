@@ -524,6 +524,131 @@ def test_open_chrome_window_falls_back_to_webbrowser(monkeypatch):
     assert opened == ["http://127.0.0.1:8765"]
 
 
+def test_tui_layout_is_responsive_and_bounded():
+    assert d.tui_layout(120, 40)["mode"] == "wide"
+    assert d.tui_layout(90, 30)["mode"] == "medium"
+    assert d.tui_layout(70, 24)["mode"] == "narrow"
+    assert d.tui_layout(50, 16)["mode"] == "compact"
+    assert d.tui_layout(40, 10)["cards"] == []
+    assert d.tui_layout(40, 10)["chart"] is None
+    wide = d.tui_layout(120, 40)
+    assert len(wide["cards"]) == 4
+    assert wide["chart"] and wide["models"] and wide["sessions"] and wide["records"]
+    assert wide["card_h"] >= 5
+    medium = d.tui_layout(90, 30)
+    assert len(medium["cards"]) == 3
+    assert medium["chart"] and medium["models"] and medium["sessions"]
+    narrow = d.tui_layout(70, 24)
+    assert len(narrow["cards"]) == 2
+    assert narrow["chart"] and narrow["models"] and narrow["sessions"]
+    # every panel gets room for a header + separator + at least one data row
+    assert narrow["sessions"][2] >= 5
+    assert medium["sessions"][2] >= 5
+    assert wide["sessions"][2] >= 5
+    # every rect stays inside the terminal and no two panels overlap
+    for w, h in ((120, 40), (90, 30), (70, 24), (60, 20)):
+        layout = d.tui_layout(w, h)
+        rects = list(layout["cards"]) + [layout[k] for k in
+                                         ("chart", "models", "sessions", "records")]
+        rects = [r for r in rects if r is not None]
+        for y, x, hh, ww in rects:
+            assert 0 <= y and 0 <= x and hh > 1 and ww > 1
+            assert y + hh <= h and x + ww <= w
+        for i, a in enumerate(rects):
+            for b in rects[i + 1:]:
+                ay, ax, ah, aw = a
+                by, bx, bh, bw = b
+                overlaps = not (ay + ah <= by or by + bh <= ay
+                                or ax + aw <= bx or bx + bw <= ax)
+                assert not overlaps, (w, h, a, b)
+
+
+def test_tui_period_totals_window_and_keys():
+    days = [
+        {"date": "2026-01-01", "ti": 100, "to": 50, "tr": 10, "cache": 40,
+         "msgs": 3, "sessions": 1, "cost": 0.01, "ok": 3, "err": 0},
+        {"date": "2026-01-02", "ti": 200, "to": 100, "tr": 20, "cache": 80,
+         "msgs": 4, "sessions": 2, "cost": 0.02, "ok": 2, "err": 2, "err429": 2,
+         "what_if": 0.3},
+    ]
+    last = d.tui_period_totals({"days": days}, 1)
+    assert last["days_used"] == 1
+    assert last["tokens_total"] == 400
+    assert last["messages"] == 4
+    assert last["sessions"] == 2
+    allp = d.tui_period_totals({"days": days}, 0)
+    assert allp["tokens_total"] == 600
+    assert allp["messages"] == 7
+    assert allp["sessions"] == 3
+    assert allp["cost"] == pytest.approx(0.03)
+    assert allp["err"] == 2 and allp["err429"] == 2
+    assert allp["what_if"] == pytest.approx(0.3)
+    assert allp["vmax"] == 400
+    empty = d.tui_period_totals(None, 14)
+    assert empty["tokens_total"] == 0 and empty["days_used"] == 0
+
+
+def test_tui_scale_blocks_buckets_and_heat():
+    assert d.tui_scale_blocks([1, 2, 3, 4], 2) == [3.0, 7.0]
+    assert d.tui_scale_blocks([1, 2], 5) == [1.0, 2.0]
+    assert d.tui_scale_blocks([], 3) == []
+    assert d.tui_scale_blocks([1, 2, 3], 0) == []
+    assert d.tui_scale_blocks(["x", "4"], 2) == [0.0, 4.0]
+    assert d.tui_heat(0, 100) == 0
+    assert d.tui_heat(10, 100) == 1
+    assert d.tui_heat(30, 100) == 2
+    assert d.tui_heat(60, 100) == 3
+    assert d.tui_heat(90, 100) == 4
+    assert d.tui_heat(5, 0) == 0
+
+
+def test_tui_fit_wrap_and_filter():
+    assert d.tui_fit("hello", 10) == "hello"
+    assert d.tui_fit("hello world", 8).endswith("…")
+    assert len(d.tui_fit("hello world", 8)) == 8
+    assert d.tui_fit("hello", 0) == ""
+    assert d.tui_fit(None, 4) == ""
+    assert d.tui_wrap("one two three four", 7) == ["one two", "three", "four"]
+    assert d.tui_wrap("", 10) == [""]
+    assert d.tui_wrap("supercalifragilistic", 6) == ["superc", "alifra", "gilist", "ic"]
+    rows = [{"title": "Fix bug", "model": "a/b"}, {"title": "Ship feature", "model": "c/d"}]
+    assert d.tui_filter_sessions(rows, "") == rows
+    assert d.tui_filter_sessions(rows, "BUG", ("title",)) == rows[:1]
+    assert d.tui_filter_sessions(rows, "C/D", ("title", "model")) == rows[1:]
+    assert d.tui_filter_sessions(None, "x") == []
+
+
+def test_tui_model_badge_and_cost_helpers():
+    # OpenCode-shaped rows: index 7 is the real session cost
+    assert d.tui_model_badge(["muse-x-free", 1, 10, 0, 0, 0, 0, 0.0001]) == "free"
+    assert d.tui_model_badge(["local", 1, 10, 0, 0, 0, 0, 0.0]) == "$0"
+    assert d.tui_model_badge(["paid", 1, 10, 0, 0, 0, 0, 1.5]) == ""
+    assert d.tui_model_badge(["x", 1, 10, 0, 0, 0, 0, 1.0, 0, 0, "p", True]) == "free"
+    assert d.tui_model_badge(None) == ""
+    assert d.tui_model_badge(["x"]) == "$0"
+    # Codex/Cline-shaped rows: index 7 is the error count, index 12 is cost
+    # (what-if for Codex, always 0 for Cline), index 11 is the free flag.
+    codex_errors = ["gpt-5.6-sol", 10, 5000, 3000, 1000, 500, 9, 3,
+                    500, 40.0, "openai", False, 12.5]
+    assert d.tui_model_badge(codex_errors, 12) == ""  # what_if > 0, no $0
+    codex_free = ["muse-spark-1.3-contributor-free", 10, 5000, 3000, 1000, 500,
+                  10, 3, 500, 40.0, "opencode-free", True, 12.5]
+    assert d.tui_model_badge(codex_free, 12) == "free"
+    codex_zero = ["local-model", 10, 5000, 3000, 1000, 500, 10, 0,
+                  500, 40.0, "local", False, 0.0]
+    assert d.tui_model_badge(codex_zero, 12) == "$0"
+    # an err=0 row with a positive what-if must not read as $0 (the old bug)
+    assert d.tui_model_badge(codex_errors, 12) != "$0"
+    assert d.tui_free_model_count([codex_zero, codex_errors, codex_free], 12) == 2
+    assert d.tui_free_model_count([["free-x", 1, 1, 0, 0, 0, 0, 0.1],
+                                   ["paid", 1, 1, 0, 0, 0, 0, 1.0],
+                                   None]) == 1
+    assert d.tui_fmt_cost(0) == "$0"
+    assert d.tui_fmt_cost(0.0003) == "$0.0003"
+    assert d.tui_fmt_cost(1.5) == "$1.50"
+    assert d.tui_fmt_cost("bad") == "$0"
+
+
 def test_activity_window_is_zero_filled(db_path):
     con = d.connect(db_path)
     try:

@@ -4707,11 +4707,15 @@ def _safe_addstr(win, y, x, text, attr=0):
     h, w = win.getmaxyx()
     if y < 0 or y >= h or x < 0 or x >= w:
         return
+    # Writing the bottom-right cell can raise curses.error (scroll); clip only
+    # that row. Every other row may use the full width so header/box fills and
+    # the rightmost column are not left blank.
+    limit = max(0, w - x - 1) if y == h - 1 else max(0, w - x)
     try:
-        win.addstr(y, x, str(text)[: max(0, w - x - 1)], attr)
+        win.addstr(y, x, str(text)[:limit], attr)
     except Exception:
-        # curses.error on the bottom-right cell is expected; encoding errors
-        # from odd DB text should never take the whole TUI down.
+        # curses.error on odd cells and encoding errors from odd DB text should
+        # never take the whole TUI down.
         pass
 
 
@@ -4749,8 +4753,306 @@ def open_chrome_window(url):
         return False
 
 
+TUI_RANGES = (("14d", 14), ("30d", 30), ("90d", 90), ("All", 0))
+
+
+def tui_layout(w, h):
+    """Responsive TUI layout for a w x h terminal (pure, no curses).
+
+    Returns a dict with `mode`, `cards` (rect list) and rects for the chart,
+    models, sessions and records panels. Panels are omitted (None) when the
+    terminal is too small, so the renderer degrades instead of crashing.
+    A rect is (y, x, height, width).
+    """
+    layout = {
+        "mode": "compact",
+        "cards": [],
+        "chart": None,
+        "models": None,
+        "sessions": None,
+        "records": None,
+        "card_h": 5,
+    }
+    if w < 60 or h < 20:
+        return layout
+    content_x = 1
+    content_w = w - 2
+    content_bottom = h - 3  # footer separator at h-2, footer at h-1
+    y = 3
+    if content_bottom < y + 6:
+        return layout
+
+    if w >= 110 and h >= 30:
+        layout["mode"] = "wide"
+        layout["card_h"] = 6
+        n_cards = 4
+    elif w >= 84 and h >= 26:
+        layout["mode"] = "medium"
+        layout["card_h"] = 6
+        n_cards = 3
+    else:
+        layout["mode"] = "narrow"
+        layout["card_h"] = 4
+        n_cards = 4 if h >= 28 else 2
+
+    # ---- KPI card row(s) ----
+    rows = 2 if (layout["mode"] == "narrow" and n_cards == 4) else 1
+    per_row = n_cards // rows if rows else n_cards
+    gap = 1
+    card_h = layout["card_h"]
+    card_w = (content_w - gap * (per_row - 1)) // per_row
+    rest = content_w - (card_w * per_row + gap * (per_row - 1))
+    for r in range(rows):
+        yy = y + r * (card_h + 1)
+        if yy + card_h - 1 > content_bottom:
+            break
+        for c in range(per_row):
+            cw = card_w + (rest if c == per_row - 1 else 0)
+            layout["cards"].append((yy, content_x + c * (card_w + gap), card_h, cw))
+    if layout["cards"]:
+        last = layout["cards"][-1]
+        # cards occupy y .. y+card_h-1, so the next free row is y+card_h
+        y = last[0] + last[2]
+
+    avail = content_bottom - y + 1
+    if avail < 4:
+        return layout
+
+    def side_by_side(yy, hh, total_w, frac):
+        left_w = int(total_w * frac)
+        left_w = max(10, left_w)
+        if total_w - left_w - 1 < 12:
+            left_w = max(10, total_w - 13)
+        right_w = total_w - left_w - 1
+        return (yy, content_x, hh, left_w), (yy, content_x + left_w + 1, hh, right_w)
+
+    mode = layout["mode"]
+    if mode in ("wide", "medium") and avail >= 16:
+        # breathing room between the KPI cards and the chart row
+        y += 1
+        avail -= 1
+    if mode == "wide":
+        mid_h = min(14, max(7, (avail * 45) // 100))
+        if avail - mid_h - 1 < 3:
+            mid_h = max(5, avail - 4)
+        chart, models = side_by_side(y, mid_h, content_w, 0.58)
+        layout["chart"] = chart
+        layout["models"] = models
+        y += mid_h + 1
+        bottom_h = content_bottom - y + 1
+        if bottom_h >= 4:
+            sess, rec = side_by_side(y, bottom_h, content_w, 0.56)
+            layout["sessions"] = sess
+            layout["records"] = rec
+        elif bottom_h >= 2:
+            layout["sessions"] = (y, content_x, bottom_h, content_w)
+    elif mode == "medium":
+        mid_h = min(12, max(6, (avail * 45) // 100))
+        chart, models = side_by_side(y, mid_h, content_w, 0.55)
+        layout["chart"] = chart
+        layout["models"] = models
+        y += mid_h + 1
+        bottom_h = content_bottom - y + 1
+        if bottom_h >= 4:
+            layout["sessions"] = (y, content_x, bottom_h, content_w)
+    else:  # narrow: stacked panels
+        # Reserve a usable sessions table (header + separator + >=1 data row)
+        # before sizing the chart/models panels above it.
+        if avail >= 15:
+            budget = avail - 7  # two 1-row gaps + 5 session rows
+            chart_h = min(8, max(4, (budget * 55) // 100))
+            models_h = min(7, max(4, budget - chart_h))
+            sessions_h = avail - chart_h - models_h - 2
+            layout["chart"] = (y, content_x, chart_h, content_w)
+            layout["models"] = (y + chart_h + 1, content_x, models_h, content_w)
+            layout["sessions"] = (
+                y + chart_h + models_h + 2, content_x, sessions_h, content_w)
+        else:
+            chart_h = min(6, max(4, avail // 3))
+            sessions_h = avail - chart_h - 1
+            layout["chart"] = (y, content_x, chart_h, content_w)
+            if sessions_h >= 4:
+                layout["sessions"] = (y + chart_h + 1, content_x, sessions_h, content_w)
+    return layout
+
+
+def tui_period_totals(stats, days):
+    """Sum day rows from a stats payload over the last `days` (0 = all days).
+
+    Works for OpenCode, Codex and Cline day rows: ti/to/tr/cache and the
+    optional reqs/ok/err/err429/cost/what_if fields are summed, while
+    tokens_total is always ti+to+tr+cache.
+    """
+    out = {
+        "ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "tokens_total": 0.0,
+        "sessions": 0, "messages": 0, "cost": 0.0, "what_if": 0.0,
+        "ok": 0, "err": 0, "err429": 0, "days_used": 0, "vmax": 0.0,
+    }
+    rows = (stats or {}).get("days") or []
+    if days and len(rows) > days:
+        rows = rows[-days:]
+    for d in rows:
+        if not isinstance(d, dict):
+            continue
+        ti = num(d.get("ti"))
+        to = num(d.get("to"))
+        tr = num(d.get("tr"))
+        ca = num(d.get("cache"))
+        out["ti"] += ti
+        out["to"] += to
+        out["tr"] += tr
+        out["cache"] += ca
+        tot = ti + to + tr + ca
+        out["tokens_total"] += tot
+        out["vmax"] = max(out["vmax"], tot)
+        out["sessions"] += int(num(d.get("sessions")))
+        out["messages"] += int(num(d.get("msgs")))
+        out["cost"] += num(d.get("cost"))
+        out["what_if"] += num(d.get("what_if"))
+        out["ok"] += int(num(d.get("ok")))
+        out["err"] += int(num(d.get("err")))
+        out["err429"] += int(num(d.get("err429")))
+        out["days_used"] += 1
+    return out
+
+
+def tui_scale_blocks(values, width):
+    """Aggregate `values` into exactly `width` columns (sum per column).
+
+    Widening returns the values unchanged; narrowing buckets consecutive
+    values so long ranges fit a small chart without dropping data.
+    """
+    if width <= 0 or not values:
+        return []
+    vals = [num(v) for v in values]
+    if width >= len(vals):
+        return vals
+    out = []
+    for i in range(width):
+        lo = (i * len(vals)) // width
+        hi = ((i + 1) * len(vals)) // width
+        out.append(sum(vals[lo:hi]) if hi > lo else 0.0)
+    return out
+
+
+def tui_heat(value, vmax):
+    """Bucket a value into 0..4 heat levels (0 = empty/invalid)."""
+    v = num(value)
+    m = num(vmax)
+    if v <= 0 or m <= 0:
+        return 0
+    frac = v / m
+    if frac >= 0.75:
+        return 4
+    if frac >= 0.5:
+        return 3
+    if frac >= 0.25:
+        return 2
+    return 1
+
+
+def tui_fit(text, width, suffix="…"):
+    """Truncate text to `width` display chars, appending `suffix` if needed."""
+    s = "" if text is None else str(text)
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width <= len(suffix):
+        return suffix[:width]
+    return s[: width - len(suffix)] + suffix
+
+
+def tui_wrap(text, width):
+    """Word-wrap text into lines of at most `width` chars (never drops chars)."""
+    if width <= 0:
+        return []
+    lines = []
+    for para in str(text if text is not None else "").splitlines() or [""]:
+        words = para.split()
+        if not words:
+            lines.append("")
+            continue
+        cur = ""
+        for word in words:
+            while len(word) > width:
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(word[:width])
+                word = word[width:]
+            if not cur:
+                cur = word
+            elif len(cur) + 1 + len(word) <= width:
+                cur += " " + word
+            else:
+                lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+    return lines
+
+
+def tui_filter_sessions(rows, text, fields=("title", "model")):
+    """Case-insensitive substring filter over selected dict fields."""
+    q = (text or "").strip().lower()
+    if not q:
+        return list(rows or [])
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        hay = " ".join(str(row.get(f, "")) for f in fields).lower()
+        if q in hay:
+            out.append(row)
+    return out
+
+
+def tui_model_badge(model_row, cost_idx=7):
+    """'free' / '$0' / '' badge for a model row (same shape as stats).
+
+    `cost_idx` is 7 for OpenCode rows (actual session cost) and 12 for
+    Codex/Cline rows (Codex: what-if paid cost; Cline: 0, it records no
+    per-model cost). Index 11 is the free flag when the payload has one.
+    """
+    if not isinstance(model_row, (list, tuple)) or not model_row:
+        return ""
+    name = str(model_row[0] or "")
+    cost = num(model_row[cost_idx]) if len(model_row) > cost_idx else 0.0
+    free_flag = bool(model_row[11]) if len(model_row) > 11 else False
+    if "free" in name.lower() or free_flag:
+        return "free"
+    if cost <= 0:
+        return "$0"
+    return ""
+
+
+def tui_fmt_cost(value):
+    """Compact cost string: $0, sub-cent precision, or 2 decimals."""
+    c = num(value)
+    if c <= 0:
+        return "$0"
+    if c < 0.01:
+        return f"${c:.4f}"
+    return f"${c:,.2f}"
+
+
+def tui_free_model_count(models, cost_idx=7):
+    """Number of models that are free or carry zero recorded cost.
+
+    Pass `cost_idx=12` for Codex/Cline payloads so the count is not driven by
+    the error count at index 7.
+    """
+    n = 0
+    for row in models or []:
+        if tui_model_badge(row, cost_idx):
+            n += 1
+    return n
+
+
 def run_tui(args):
     import curses
+    import locale
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
@@ -4787,12 +5089,52 @@ def run_tui(args):
             file=sys.stderr,
         )
 
-    state = {"tab": 0, "S": None, "R": None, "C": None, "msg": "", "last": 0.0,
-             "url": url}
+    # ---- glyph set: UTF-8 where the terminal can take it, ASCII otherwise ----
+    def _init_glyphs():
+        enc = ""
+        try:
+            enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+        except Exception:
+            enc = ""
+        pref = ""
+        try:
+            pref = (locale.getpreferredencoding(False) or "").lower()
+        except Exception:
+            pref = ""
+        if "utf" in enc or (not enc and "utf" in pref):
+            return {
+                "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│",
+                "bar": "█", "spark": [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
+                "heat": ["░", "▒", "▓", "█"],
+                "dot": "●", "arrow": "▶", "ell": "…", "mid": "·", "sep": "  ·  ",
+                "spin": ["◐", "◓", "◑", "◒"],
+            }
+        return {
+            "tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
+            "bar": "#", "spark": [" ", ".", ":", "-", "=", "+", "*", "#", "#"],
+            "heat": [".", ":", "+", "#"],
+            "dot": "*", "arrow": ">", "ell": "..", "mid": "|", "sep": "  |  ",
+            "spin": ["|", "/", "-", "\\"],
+        }
+
+    G = _init_glyphs()
+    state = {
+        "tab": 0, "S": None, "R": None, "C": None,
+        "msg": "", "last": 0.0, "url": url,
+        "sel": [0, 0, 0, 0],
+        "modal": None, "filter": "", "search": None,
+        "range_idx": 1, "loading": False, "spinner": 0,
+    }
     tabs = ["OpenCode", "Codex", "Cline", "Recap"]
+    render = {"pal": None}
+
+    def clear_caches():
+        with LOCK:
+            LOCAL_CACHE.clear()
+            ROUTER_CACHE.clear()
+            CLINE_CACHE.clear()
 
     def load_data():
-        state["msg"] = "Loading..."
         wt = db_worktrees(args.db)
         try:
             state["S"] = cached_local_stats(args.db)
@@ -4809,245 +5151,1308 @@ def run_tui(args):
             state["C"] = None
         state["last"] = time.time()
         if state["url"]:
-            state["msg"] = "Ready  (r refresh, o open Chrome UI, q quit)"
+            state["msg"] = "updated " + datetime.now().strftime("%H:%M:%S")
         else:
-            state["msg"] = f"No Chrome UI server: ports {args.port}-{args.port + 10} busy"
+            state["msg"] = f"no web UI (ports {args.port}-{args.port + 10} busy)"
 
+    # ---------------------------------------------------------------- palette
+    def _init_palette():
+        keys = ("hdr", "hdr_dim", "acc", "acc2", "good", "warn", "bad", "mag",
+                "dim", "muted", "border", "value", "sel", "tab")
+        pal = {k: 0 for k in keys}
+        pal["heat"] = []
+        try:
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+            except Exception:
+                pass
+        except Exception:
+            return pal
+        if getattr(curses, "COLORS", 0) >= 256:
+            spec = {
+                "hdr": (231, 17), "hdr_dim": (146, 17),
+                "acc": (51, -1), "acc2": (44, -1), "good": (48, -1),
+                "warn": (214, -1), "bad": (203, -1), "mag": (213, -1),
+                "dim": (245, -1), "muted": (240, -1), "border": (60, -1),
+                "value": (231, -1), "sel": (231, 24), "tab": (16, 51),
+            }
+            heat = [(236, -1), (24, -1), (31, -1), (45, -1), (51, -1)]
+        else:
+            C = curses
+            spec = {
+                "hdr": (C.COLOR_WHITE, C.COLOR_BLUE), "hdr_dim": (C.COLOR_CYAN, C.COLOR_BLUE),
+                "acc": (C.COLOR_CYAN, -1), "acc2": (C.COLOR_GREEN, -1),
+                "good": (C.COLOR_GREEN, -1), "warn": (C.COLOR_YELLOW, -1),
+                "bad": (C.COLOR_RED, -1), "mag": (C.COLOR_MAGENTA, -1),
+                "dim": (C.COLOR_WHITE, -1), "muted": (C.COLOR_WHITE, -1),
+                "border": (C.COLOR_BLUE, -1), "value": (C.COLOR_WHITE, -1),
+                "sel": (C.COLOR_BLACK, C.COLOR_CYAN), "tab": (C.COLOR_BLACK, C.COLOR_CYAN),
+            }
+            heat = [(C.COLOR_BLUE, -1), (C.COLOR_CYAN, -1), (C.COLOR_GREEN, -1),
+                    (C.COLOR_YELLOW, -1), (C.COLOR_MAGENTA, -1)]
+        idx = 1
+        for key, (fg, bg) in spec.items():
+            try:
+                curses.init_pair(idx, fg, bg)
+                pal[key] = curses.color_pair(idx)
+            except Exception:
+                pal[key] = 0
+            idx += 1
+        for fg, bg in heat:
+            try:
+                curses.init_pair(idx, fg, bg)
+                pal["heat"].append(curses.color_pair(idx))
+            except Exception:
+                pal["heat"].append(0)
+            idx += 1
+        return pal
+
+    # -------------------------------------------------------- draw primitives
+    def fill(win, y, x, hh, ww, attr=0):
+        if hh <= 0 or ww <= 0:
+            return
+        row = " " * ww
+        for i in range(hh):
+            _safe_addstr(win, y + i, x, row, attr)
+
+    def box(win, rect, title="", border_attr=0, title_attr=0):
+        y, x, hh, ww = rect
+        if hh < 2 or ww < 2:
+            return
+        _safe_addstr(win, y, x, G["tl"] + G["h"] * (ww - 2) + G["tr"], border_attr)
+        _safe_addstr(win, y + hh - 1, x, G["bl"] + G["h"] * (ww - 2) + G["br"], border_attr)
+        for i in range(1, hh - 1):
+            _safe_addstr(win, y + i, x, G["v"], border_attr)
+            _safe_addstr(win, y + i, x + ww - 1, G["v"], border_attr)
+        if title and ww > 6:
+            t = " " + tui_fit(title, ww - 6, G["ell"]) + " "
+            _safe_addstr(win, y, x + max(2, (ww - len(t)) // 2), t, title_attr or border_attr)
+
+    def put(win, y, x, text, attr=0):
+        _safe_addstr(win, y, x, text, attr)
+
+    def pct(part, whole):
+        return (part / whole * 100) if whole else 0.0
+
+    # ---------------------------------------------------------------- cards
+    def _no_data_card(title, pal):
+        return {
+            "title": title,
+            "value": "no data",
+            "value_attr": pal["warn"] | curses.A_BOLD,
+            "details": [("hint", state.get("msg") or "waiting…")],
+        }
+
+    def build_cards(tab, pal):
+        BOLD = curses.A_BOLD
+        days = TUI_RANGES[state["range_idx"]][1]
+        if tab == 0:
+            S = state["S"]
+            if not S:
+                return [_no_data_card("OpenCode", pal)]
+            p = tui_period_totals(S, days)
+            rec = (S.get("records") or {})
+            streaks = rec.get("streaks") or {}
+            big = rec.get("biggest_day") or {}
+            free_n = tui_free_model_count(S.get("models"))
+            return [
+                {
+                    "title": "Tokens",
+                    "value": _fmt(p["tokens_total"]),
+                    "value_attr": pal["acc"] | BOLD,
+                    "bar": [("acc", p["ti"]), ("acc2", p["to"]),
+                            ("mag", p["tr"]), ("warn", p["cache"])],
+                    "details": [
+                        ("input", _fmt(p["ti"])),
+                        ("output", _fmt(p["to"])),
+                        ("reasoning", _fmt(p["tr"])),
+                        ("cache", _fmt(p["cache"])),
+                    ],
+                },
+                {
+                    "title": "Sessions",
+                    "value": str(p["sessions"]),
+                    "value_attr": pal["value"] | BOLD,
+                    "details": [
+                        ("messages", str(p["messages"])),
+                        ("avg / session", _fmt(p["tokens_total"] / p["sessions"] if p["sessions"] else 0)),
+                        ("streak", f"{streaks.get('current', 0)}d"),
+                    ],
+                },
+                {
+                    "title": "Cost",
+                    "value": tui_fmt_cost(p["cost"]),
+                    "value_attr": pal["good"] | BOLD,
+                    "details": [
+                        ("cache rate", f"{cache_rate(p['ti'], p['cache']):.1f}%"),
+                        ("free models", str(free_n)),
+                        ("cost / 1M tok", tui_fmt_cost(p["cost"] / (p["tokens_total"] / 1e6) if p["tokens_total"] else 0)),
+                    ],
+                },
+                {
+                    "title": "Activity",
+                    "value": f"{streaks.get('current', 0)}d",
+                    "value_attr": pal["mag"] | BOLD,
+                    "details": [
+                        ("longest", f"{streaks.get('longest', 0)}d"),
+                        ("best day", str(big.get("date") or "—")),
+                        ("best day tokens", _fmt(big.get("total", 0))),
+                    ],
+                },
+            ]
+        if tab == 1:
+            R = state["R"]
+            if not R:
+                return [_no_data_card("Codex", pal)]
+            p = tui_period_totals(R, days)
+            top = (R.get("models") or [None])[0]
+            return [
+                {
+                    "title": "Requests",
+                    "value": str(p["messages"]),
+                    "value_attr": pal["acc"] | BOLD,
+                    "details": [
+                        ("ok", str(p["ok"])),
+                        ("errors", str(p["err"])),
+                        ("429s", str(p["err429"])),
+                    ],
+                },
+                {
+                    "title": "Tokens",
+                    "value": _fmt(p["tokens_total"]),
+                    "value_attr": pal["value"] | BOLD,
+                    "bar": [("acc", p["ti"]), ("acc2", p["to"])],
+                    "details": [
+                        ("input incl cache", _fmt(p["ti"])),
+                        ("output", _fmt(p["to"])),
+                        ("cache", _fmt(p["cache"])),
+                    ],
+                },
+                {
+                    "title": "Errors",
+                    "value": str(p["err"]),
+                    "value_attr": (pal["bad"] if p["err"] else pal["good"]) | BOLD,
+                    "details": [
+                        ("429 rate-limit", str(p["err429"])),
+                        ("unmetered", str(((R.get("totals") or {}).get("unmetered", 0)))),
+                        ("models", str(len(R.get("models") or []))),
+                    ],
+                },
+                {
+                    "title": "What-if cost",
+                    "value": tui_fmt_cost(p["what_if"]),
+                    "value_attr": pal["good"] | BOLD,
+                    "details": [
+                        ("requests", str(p["messages"])),
+                        ("top model", tui_fit(router_short(str(top[0]) if top else "—"), 18, G["ell"])),
+                        ("avg / req", _fmt(p["tokens_total"] / p["messages"] if p["messages"] else 0)),
+                    ],
+                },
+            ]
+        C = state["C"]
+        if not C:
+            return [_no_data_card("Cline", pal)]
+        p = tui_period_totals(C, days)
+        return [
+            {
+                "title": "Requests",
+                "value": str(p["messages"]),
+                "value_attr": pal["acc"] | BOLD,
+                "details": [
+                    ("ok", str(p["ok"])),
+                    ("errors", str(p["err"])),
+                    ("models", str(len(C.get("models") or []))),
+                ],
+            },
+            {
+                "title": "Sessions",
+                "value": str(p["sessions"]),
+                "value_attr": pal["value"] | BOLD,
+                "details": [
+                    ("messages", str(p["messages"])),
+                    ("avg / session", _fmt(p["tokens_total"] / p["sessions"] if p["sessions"] else 0)),
+                    ("providers", str(len(C.get("providers") or []))),
+                ],
+            },
+            {
+                "title": "Tokens",
+                "value": _fmt(p["tokens_total"]),
+                "value_attr": pal["acc2"] | BOLD,
+                "bar": [("acc", p["ti"]), ("acc2", p["to"]), ("warn", p["cache"])],
+                "details": [
+                    ("input", _fmt(p["ti"])),
+                    ("output", _fmt(p["to"])),
+                    ("cache", _fmt(p["cache"])),
+                ],
+            },
+            {
+                "title": "Cache",
+                "value": _fmt(p["cache"]),
+                "value_attr": pal["warn"] | BOLD,
+                "details": [
+                    ("cache rate", f"{cache_rate(p['ti'], p['cache']):.1f}%"),
+                    ("cache / req", _fmt(p["cache"] / p["messages"] if p["messages"] else 0)),
+                ],
+            },
+        ]
+
+    def draw_cards(win, rects, cards, pal):
+        for rect, card in zip(rects, cards):
+            y, x, hh, ww = rect
+            if hh < 3 or ww < 8:
+                continue
+            box(win, rect, card.get("title", ""), pal["border"],
+                pal["acc"] | curses.A_BOLD)
+            ix = x + 2
+            iw = ww - 4
+            if iw < 4:
+                continue
+            yy = y + 1
+            put(win, yy, ix, tui_fit(card.get("value", ""), iw),
+                card.get("value_attr") or (pal["value"] | curses.A_BOLD))
+            yy += 1
+            bar_parts = card.get("bar") or []
+            if bar_parts and yy <= y + hh - 2:
+                total = sum(max(0.0, num(f)) for _k, f in bar_parts) or 1.0
+                bx = ix
+                for key, frac in bar_parts:
+                    seg = int(round(max(0.0, num(frac)) / total * iw))
+                    if seg <= 0 or bx >= ix + iw:
+                        continue
+                    seg = min(seg, ix + iw - bx)
+                    put(win, yy, bx, G["bar"] * seg, pal.get(key, 0))
+                    bx += seg
+                yy += 1
+            for label, value in card.get("details", []):
+                if yy > y + hh - 2:
+                    break
+                lab = tui_fit(str(label), max(1, iw - 10), G["ell"])
+                val = tui_fit(str(value), max(4, iw // 2 + 2), G["ell"])
+                put(win, yy, ix, lab, pal["muted"])
+                put(win, yy, ix + max(0, iw - len(val)), val, pal["dim"] | curses.A_BOLD)
+                yy += 1
+
+    # ---------------------------------------------------------------- chart
+    def draw_chart(win, rect, rows, pal, range_label):
+        y, x, hh, ww = rect
+        box(win, rect, f"Token activity {G['mid']} {range_label}", pal["border"],
+            pal["acc"] | curses.A_BOLD)
+        iw = ww - 4
+        if iw < 8 or hh < 4:
+            return
+        ix = x + 2
+        vals = []
+        dates = []
+        for d in rows or []:
+            if not isinstance(d, dict):
+                continue
+            vals.append(num(d.get("ti")) + num(d.get("to")) + num(d.get("tr")) + num(d.get("cache")))
+            dates.append(str(d.get("date") or ""))
+        if not vals:
+            put(win, y + 1, ix, "no activity in this range", pal["muted"])
+            return
+        total = sum(vals)
+        vmax = max(vals) or 1.0
+        cols = tui_scale_blocks(vals, iw)
+        col_max = max(cols) or 1.0
+        if hh >= 5:
+            put(win, y + 1, ix, f"total {_fmt(total)}   peak {_fmt(vmax)}   days {len(vals)}",
+                pal["muted"])
+            labels_y = y + hh - 2
+            bar_bottom = labels_y - 1
+            bar_top = y + 2
+        else:
+            labels_y = None
+            bar_top = y + 1
+            bar_bottom = y + hh - 2
+        bh = max(1, bar_bottom - bar_top + 1)
+        for i, v in enumerate(cols):
+            if i >= iw:
+                break
+            eighths = int(round(v / col_max * bh * 8)) if col_max else 0
+            eighths = max(0, min(bh * 8, eighths))
+            level = tui_heat(v, col_max)
+            attr = pal["heat"][level] if pal["heat"] else pal["acc"]
+            cx = ix + i
+            full, rem = divmod(eighths, 8)
+            for j in range(min(full, bh)):
+                put(win, bar_bottom - j, cx, G["bar"], attr)
+            if rem and full < bh:
+                put(win, bar_bottom - full, cx, G["spark"][rem], attr)
+        if labels_y is not None and dates:
+            mid = dates[len(dates) // 2]
+            put(win, labels_y, ix, tui_fit(dates[0], max(5, iw // 3), G["ell"]), pal["muted"])
+            put(win, labels_y, ix + max(0, (iw - len(mid)) // 2), mid, pal["muted"])
+            put(win, labels_y, ix + max(0, iw - len(dates[-1])), dates[-1], pal["muted"])
+
+    # ---------------------------------------------------------------- models
+    def draw_models(win, rect, models, pal, cost_idx=7):
+        """Top models table; `cost_idx` is 7 for OpenCode and 12 for Codex/Cline."""
+        y, x, hh, ww = rect
+        box(win, rect, f"Top models {G['mid']} all time", pal["border"],
+            pal["acc"] | curses.A_BOLD)
+        iw = ww - 4
+        if iw < 10 or hh < 3:
+            return
+        ix = x + 2
+        rows = [m for m in (models or []) if isinstance(m, (list, tuple)) and len(m) >= 3]
+        if not rows:
+            put(win, y + 1, ix, "no model data", pal["muted"])
+            return
+        vmax = max(num(m[2]) for m in rows) or 1.0
+        show_cost = iw >= 40
+        if show_cost:
+            tail_w = 7 + 2 + 7 + 2 + 5
+        else:
+            # narrow models panel: keep tokens + the free/$0 badge, drop cost
+            tail_w = 7 + 2 + 5
+        tail_x = ix + max(0, iw - tail_w)
+        name_space = max(6, tail_x - ix - 1)
+        bar_w = min(16, max(0, name_space - 16))
+        name_w = max(6, name_space - (bar_w + 1 if bar_w else 0))
+        put(win, y + 1, ix, tui_fit("model", name_w, G["ell"]), pal["muted"])
+        if show_cost:
+            put(win, y + 1, tail_x, f"{'tokens':>7}  {'cost':>7}", pal["muted"])
+        else:
+            put(win, y + 1, tail_x, f"{'tokens':>7}", pal["muted"])
+        visible = max(1, hh - 3)
+        for i, m in enumerate(rows[:visible]):
+            yy = y + 2 + i
+            if yy > y + hh - 2:
+                break
+            name = str(m[0])
+            tot = num(m[2])
+            cost = num(m[cost_idx]) if len(m) > cost_idx else 0.0
+            badge = tui_model_badge(m, cost_idx)
+            put(win, yy, ix, tui_fit(name, name_w, G["ell"]),
+                pal["value"] if i == 0 else pal["dim"])
+            if bar_w > 0:
+                frac = tot / vmax if vmax else 0.0
+                filled = max(0, min(bar_w, int(round(frac * bar_w))))
+                level = tui_heat(tot, vmax)
+                attr = pal["heat"][level] if pal["heat"] else pal["acc"]
+                put(win, yy, ix + name_w + 1, G["bar"] * filled, attr)
+            if show_cost:
+                num_txt = f"{_fmt(tot):>7}  {tui_fit(tui_fmt_cost(cost), 7):>7}  "
+                put(win, yy, tail_x, num_txt, pal["muted"])
+                if badge:
+                    attr = pal["good"] | curses.A_BOLD if badge == "free" else pal["good"]
+                    put(win, yy, tail_x + len(num_txt), f"{badge:<5}", attr)
+            else:
+                put(win, yy, tail_x, f"{_fmt(tot):>7}  ", pal["dim"] | curses.A_BOLD)
+                if badge:
+                    attr = pal["good"] | curses.A_BOLD if badge == "free" else pal["good"]
+                    put(win, yy, tail_x + 9, f"{badge:<5}", attr)
+
+    # --------------------------------------------------------------- heatmap
+    def draw_heatmap(win, y, x, iw, hh, activity, pal):
+        """7 rows x N columns of heat cells; returns the rows consumed."""
+        slots = [s for s in (activity or []) if isinstance(s, dict)]
+        if not slots or iw < 24 or hh < 8:
+            return 0
+        weeks = min(iw - 2, 53)
+        need = weeks * 7
+        wd = datetime.now().weekday()
+        last_idx = need - 7 + wd
+        if last_idx < 0:
+            return 0
+        n = min(len(slots), last_idx + 1)
+        chunk = slots[-n:] if n else []
+        grid = [[None] * weeks for _ in range(7)]
+        start = last_idx - n + 1
+        for i, s in enumerate(chunk):
+            gi = start + i
+            if 0 <= gi < need:
+                grid[gi % 7][gi // 7] = s
+        vmax = 0.0
+        for s in chunk:
+            vmax = max(vmax, num(s.get("ti")) + num(s.get("to")) + num(s.get("tr")) + num(s.get("cache")))
+        heat = G["heat"]
+        for col in range(weeks):
+            for row in range(7):
+                s = grid[row][col]
+                cx = x + col
+                cy = y + row
+                if s is None:
+                    put(win, cy, cx, heat[0], pal["muted"])
+                    continue
+                v = num(s.get("ti")) + num(s.get("to")) + num(s.get("tr")) + num(s.get("cache"))
+                level = tui_heat(v, vmax)
+                glyph = heat[0] if level == 0 else heat[min(level, len(heat) - 1)]
+                attr = pal["heat"][level] if pal["heat"] else 0
+                put(win, cy, cx, glyph, attr)
+        used = 7
+        if hh >= 9:
+            prev = None
+            for col in range(weeks):
+                s = None
+                for row in range(7):
+                    if grid[row][col] is not None:
+                        s = grid[row][col]
+                        break
+                if not s:
+                    continue
+                month = str(s.get("date") or "")[:7]
+                if month and month != prev:
+                    try:
+                        label = datetime.strptime(month, "%Y-%m").strftime("%b")
+                    except ValueError:
+                        label = month
+                    put(win, y + 7, x + col, label, pal["muted"])
+                    prev = month
+            used = 8
+        return used
+
+    # ---------------------------------------------------------------- panels
+    def draw_records(win, rect, records, activity, pal):
+        y, x, hh, ww = rect
+        box(win, rect, f"Records {G['mid']} 52 weeks", pal["border"],
+            pal["acc"] | curses.A_BOLD)
+        iw = ww - 4
+        if iw < 8 or hh < 4:
+            return
+        ix = x + 2
+        yy = y + 1
+        if iw >= 24 and hh >= 12:
+            yy += draw_heatmap(win, yy, ix, iw, hh - 2, activity, pal)
+        rec = records or {}
+        lines = []
+        bd = rec.get("biggest_day")
+        if bd:
+            lines.append(("best day", f"{bd.get('date', '—')} {G['mid']} {_fmt(bd.get('total', 0))}"))
+        bs = rec.get("biggest_session")
+        if bs:
+            lines.append(("best session", str(bs.get("title") or "—")))
+        fb = rec.get("fastest_burn")
+        if fb:
+            lines.append(("fastest burn", f"{_fmt(fb.get('burn', 0))}/min"))
+        st = rec.get("streaks") or {}
+        lines.append(("streak now", f"{st.get('current', 0)}d"))
+        lines.append(("streak best", f"{st.get('longest', 0)}d"))
+        for label, value in lines:
+            if yy > y + hh - 2:
+                break
+            val = tui_fit(str(value), max(4, iw // 2 + 4), G["ell"])
+            put(win, yy, ix, tui_fit(label, max(4, iw - len(val) - 1), G["ell"]), pal["muted"])
+            put(win, yy, ix + max(0, iw - len(val)), val, pal["dim"] | curses.A_BOLD)
+            yy += 1
+        if not lines and yy <= y + hh - 2:
+            put(win, yy, ix, "no records yet", pal["muted"])
+
+    def draw_side_panel(win, rect, tab, pal):
+        y, x, hh, ww = rect
+        payload = state["R"] if tab == 1 else state["C"]
+        title = "Rate limits" if tab == 1 else "Providers"
+        box(win, rect, f"{title} {G['mid']} insights", pal["border"], pal["acc"] | curses.A_BOLD)
+        iw = ww - 4
+        if iw < 8 or hh < 4:
+            return
+        ix = x + 2
+        yy = y + 1
+        lines = []
+        if tab == 1:
+            limits = (payload or {}).get("rate_limits") or {}
+            for key, value in list(limits.items())[:4]:
+                if isinstance(value, dict):
+                    value = "  ".join(f"{k} {v}" for k, v in value.items())
+                lines.append((str(key), str(value)))
+        else:
+            for prov in ((payload or {}).get("providers") or [])[:6]:
+                if isinstance(prov, (list, tuple)) and len(prov) >= 3:
+                    lines.append((str(prov[0]), f"{prov[1]} req {G['mid']} {_fmt(prov[2])}"))
+        if not lines:
+            for ins in ((payload or {}).get("insights") or [])[:8]:
+                lines.append(("", str(ins)))
+        for label, value in lines:
+            if yy > y + hh - 2:
+                break
+            if label:
+                put(win, yy, ix, tui_fit(label, max(6, iw // 3), G["ell"]), pal["acc2"])
+                put(win, yy, ix + max(0, iw // 3 + 1),
+                    tui_fit(value, max(6, iw - iw // 3 - 1), G["ell"]), pal["dim"])
+            else:
+                put(win, yy, ix, tui_fit(value, iw, G["ell"]), pal["muted"])
+            yy += 1
+        if not lines and yy <= y + hh - 2:
+            put(win, yy, ix, "no data", pal["muted"])
+
+    # ---------------------------------------------------------------- table
+    TABLE_SPECS = {
+        0: ("Recent sessions", [
+            ("title", -1, "l"), ("model", 16, "l"), ("tokens", 8, "r"),
+            ("msgs", 5, "r"), ("cost", 8, "r"),
+        ]),
+        1: ("Recent requests", [
+            ("time", 8, "l"), ("model", -1, "l"), ("st", 4, "r"),
+            ("tokens", 8, "r"), ("ms", 7, "r"),
+        ]),
+        2: ("Cline sessions", [
+            ("title", -1, "l"), ("model", 16, "l"), ("tokens", 8, "r"),
+            ("msgs", 5, "r"),
+        ]),
+    }
+
+    def table_cells(tab, row):
+        if not isinstance(row, dict):
+            return []
+        if tab == 0:
+            return [
+                str(row.get("title") or "(untitled)"),
+                router_short(row.get("model")) or "—",
+                _fmt(row.get("tokens_total", 0)),
+                str(row.get("msgs", 0)),
+                tui_fmt_cost(row.get("cost")),
+            ]
+        if tab == 1:
+            at = str(row.get("at") or "")
+            hhmm = at[11:19] if len(at) >= 19 else at[-8:]
+            return [
+                hhmm or "—",
+                router_short(row.get("model")),
+                "ok" if row.get("ok") else str(row.get("status", "err")),
+                _fmt(row.get("total", 0)),
+                f"{num(row.get('ms', 0)):.0f}ms",
+            ]
+        return [
+            str(row.get("title") or row.get("id") or "(session)"),
+            router_short(row.get("model")),
+            _fmt(row.get("tokens_total", 0)),
+            str(row.get("msgs", 0)),
+        ]
+
+    def draw_table(win, rect, tab, rows, pal):
+        title, cols = TABLE_SPECS[tab]
+        y, x, hh, ww = rect
+        box(win, rect, title, pal["border"], pal["acc"] | curses.A_BOLD)
+        iw = ww - 2
+        if iw < 16 or hh < 4:
+            return
+        ix = x + 1
+        marker_w = 2
+        fixed = sum(wd for _n, wd, _a in cols if wd > 0)
+        flex_n = sum(1 for _n, wd, _a in cols if wd < 0)
+        gaps = len(cols) - 1
+        flex_w = max(6, (iw - marker_w - fixed - gaps) // flex_n) if flex_n else 0
+        widths = [flex_w if wd < 0 else wd for _n, wd, _a in cols]
+        while len(widths) > 1 and sum(widths) + marker_w + len(widths) - 1 > iw:
+            widths.pop()
+            cols = cols[:len(widths)]
+        sel = state["sel"][tab]
+        if rows:
+            sel = max(0, min(sel, len(rows) - 1))
+            state["sel"][tab] = sel
+        else:
+            sel = 0
+            state["sel"][tab] = 0
+        hint = hh >= 6
+        # 3 chrome rows (border, header, separator) + the hint row when shown;
+        # never let the last data row land on the hint or bottom border.
+        rows_h = max(0, hh - 3 - (2 if hint else 1))
+        first = 0
+        if rows and rows_h:
+            first = max(0, sel - rows_h // 2)
+            first = min(first, max(0, len(rows) - rows_h))
+        hdr_y = y + 1
+        cx = ix + marker_w
+        for (name, _wd, align), wd in zip(cols, widths):
+            txt = tui_fit(name.upper(), wd, G["ell"])
+            txt = txt.rjust(wd) if align == "r" else txt.ljust(wd)
+            put(win, hdr_y, cx, txt, pal["muted"])
+            cx += wd + 1
+        put(win, y + 2, ix, G["h"] * iw, pal["muted"])
+        for i in range(rows_h):
+            idx = first + i
+            if idx >= len(rows):
+                break
+            ry = y + 3 + i
+            if ry > y + hh - 2:
+                break
+            selected = idx == sel
+            if selected:
+                put(win, ry, ix, " " * iw, pal["sel"])
+            marker = G["arrow"] + " " if selected else "  "
+            put(win, ry, ix, marker, pal["sel"] | curses.A_BOLD if selected else pal["muted"])
+            cells = table_cells(tab, rows[idx])
+            cx = ix + marker_w
+            for j, wd in enumerate(widths):
+                txt = cells[j] if j < len(cells) else ""
+                txt = tui_fit(txt, wd, G["ell"])
+                txt = txt.rjust(wd) if cols[j][2] == "r" else txt.ljust(wd)
+                if selected:
+                    attr = pal["sel"]
+                elif j == 0:
+                    attr = pal["value"]
+                else:
+                    attr = pal["dim"]
+                put(win, ry, cx, txt, attr)
+                cx += wd + 1
+        if hint:
+            note = f"{sel + 1 if rows else 0}/{len(rows)}"
+            if state.get("filter"):
+                note = f"filter: {tui_fit(state['filter'], 16, G['ell'])} {G['mid']} {note}"
+            put(win, y + hh - 2, ix, tui_fit(note, max(4, iw - 18), G["ell"]), pal["muted"])
+            put(win, y + hh - 2, ix + max(0, iw - 17), "j/k enter / esc", pal["muted"])
+
+    # ---------------------------------------------------------------- recap
+    def draw_recap(win, y, x, hh, ww, pal):
+        box(win, (y, x, hh, ww), f"Recap {G['mid']} all harnesses", pal["border"],
+            pal["acc"] | curses.A_BOLD)
+        iw = ww - 4
+        if iw < 10 or hh < 4:
+            return
+        ix = x + 2
+        days = TUI_RANGES[state["range_idx"]][1]
+        rng = TUI_RANGES[state["range_idx"]][0]
+        ps = tui_period_totals(state["S"], days) if state["S"] else None
+        pr = tui_period_totals(state["R"], days) if state["R"] else None
+        pc = tui_period_totals(state["C"], days) if state["C"] else None
+        oc = ps["tokens_total"] if ps else 0.0
+        rx = pr["tokens_total"] if pr else 0.0
+        cn = pc["tokens_total"] if pc else 0.0
+        total = oc + rx + cn
+        put(win, y + 1, ix, f"TOTAL {_fmt(total)}", pal["mag"] | curses.A_BOLD)
+        put(win, y + 1, ix + 24, f"range {rng}   today {_fmt(tui_period_totals(state['S'], 1)['tokens_total'] + tui_period_totals(state['R'], 1)['tokens_total'] + tui_period_totals(state['C'], 1)['tokens_total'])}",
+            pal["muted"])
+        put(win, y + 2, ix, f"OpenCode {_fmt(oc)}   Codex {_fmt(rx)}   Cline {_fmt(cn)}", pal["dim"])
+        by = y + 4
+        denom = total or 1.0
+        bx = ix
+        for value, key in ((oc, "acc"), (rx, "acc2"), (cn, "mag")):
+            seg = int(round(value / denom * iw))
+            if seg > 0 and bx < ix + iw:
+                seg = min(seg, ix + iw - bx)
+                put(win, by, bx, G["bar"] * seg, pal[key])
+                bx += seg
+        put(win, by + 1, ix,
+            f"{pct(oc, total):.0f}% OpenCode {G['mid']} {pct(rx, total):.0f}% Codex {G['mid']} {pct(cn, total):.0f}% Cline",
+            pal["muted"])
+        yy = by + 3
+        for label, p, key in (("OpenCode", ps, "acc"), ("Codex", pr, "acc2"), ("Cline", pc, "mag")):
+            if yy > y + hh - 2:
+                break
+            put(win, yy, ix, f"{label:<9}", pal[key] | curses.A_BOLD)
+            if p:
+                put(win, yy, ix + 10,
+                    f"{_fmt(p['tokens_total']):>9}   {p['messages']:>6} req   {p['sessions']:>5} sessions",
+                    pal["dim"])
+            else:
+                put(win, yy, ix + 10, "no data", pal["muted"])
+            yy += 1
+        if yy <= y + hh - 2:
+            put(win, yy, ix, f"press t to change range {G['mid']} bars and cards follow it", pal["muted"])
+
+    # ------------------------------------------------------------- compact
+    def draw_compact(win, w, h, pal):
+        """Rounded summary card + sparkline for terminals below the panel grid."""
+        tab = state["tab"]
+        days = TUI_RANGES[state["range_idx"]][1]
+        rng = TUI_RANGES[state["range_idx"]][0]
+        names = {0: "OpenCode", 1: "Codex", 2: "Cline", 3: "Recap"}
+        payload = {0: state["S"], 1: state["R"], 2: state["C"]}.get(tab)
+
+        def period(source):
+            return tui_period_totals(source, days) if source else tui_period_totals(None, days)
+
+        box_h = h - 5  # rows 3 .. h-3; footer separator stays on h-2
+        if box_h < 4 or w < 26:
+            # tiny terminal: plain summary lines, no borders
+            p = period(payload)
+            if tab == 3:
+                oc = period(state["S"])["tokens_total"]
+                rx = period(state["R"])["tokens_total"]
+                cn = period(state["C"])["tokens_total"]
+                lines = [("TOTAL", _fmt(oc + rx + cn), "mag"),
+                         ("OpenCode", _fmt(oc), "acc"),
+                         ("Codex", _fmt(rx), "acc2"),
+                         ("Cline", _fmt(cn), "mag")]
+            else:
+                lines = [("Tokens", _fmt(p["tokens_total"]), "acc"),
+                         ("Sessions", str(p["sessions"]), "value"),
+                         ("Messages", str(p["messages"]), "value"),
+                         ("Cost", tui_fmt_cost(p["cost"]), "good")]
+            yy = 3
+            for label, value, key in lines:
+                if yy > h - 3:
+                    break
+                put(win, yy, 2, f"{label:<10}", pal["muted"])
+                put(win, yy, 13, tui_fit(value, max(4, w - 15), G["ell"]),
+                    pal[key] | curses.A_BOLD)
+                yy += 1
+            return
+
+        box(win, (3, 1, box_h, w - 2), f"{names.get(tab, '')} {G['mid']} {rng}",
+            pal["border"], pal["acc"] | curses.A_BOLD)
+        ix = 3
+        iw = w - 6
+        if iw < 12:
+            return
+        y = 3
+        bottom = y + box_h - 2
+
+        def kv(yy, label, value, attr=None):
+            if yy > bottom:
+                return
+            lab = tui_fit(str(label), max(4, iw // 2), G["ell"])
+            val = tui_fit(str(value), max(4, iw - len(lab) - 1), G["ell"])
+            put(win, yy, ix, lab, pal["muted"])
+            put(win, yy, ix + iw - len(val), val, attr or (pal["dim"] | curses.A_BOLD))
+
+        def spark(yy, source):
+            if yy > bottom:
+                return
+            rows = (source or {}).get("days") or []
+            vals = [num(d.get("ti")) + num(d.get("to")) + num(d.get("tr")) + num(d.get("cache"))
+                    for d in rows if isinstance(d, dict)]
+            if days:
+                vals = vals[-days:]
+            cols = tui_scale_blocks(vals, iw)
+            vmax = max(cols) if cols else 0.0
+            if not cols or vmax <= 0:
+                put(win, yy, ix, "no activity in this range", pal["muted"])
+                return
+            for i, v in enumerate(cols[:iw]):
+                level = int(round(v / vmax * 8)) if vmax else 0
+                put(win, yy, ix + i, G["spark"][max(0, min(8, level))], pal["acc"])
+
+        def top_model(yy, models):
+            if yy > bottom:
+                return
+            rows = [m for m in (models or []) if isinstance(m, (list, tuple)) and m]
+            if not rows:
+                return
+            m = rows[0]
+            badge = tui_model_badge(m, 12 if tab in (1, 2) else 7)
+            put(win, yy, ix, "top model", pal["muted"])
+            room = iw - 11 - (len(badge) + 1 if badge else 0)
+            put(win, yy, ix + 10, tui_fit(str(m[0]), max(6, room), G["ell"]), pal["dim"])
+            if badge:
+                put(win, yy, ix + iw - len(badge), badge, pal["good"] | curses.A_BOLD)
+
+        if tab == 3:
+            oc = period(state["S"])["tokens_total"]
+            rx = period(state["R"])["tokens_total"]
+            cn = period(state["C"])["tokens_total"]
+            total = oc + rx + cn
+            put(win, y + 1, ix, _fmt(total), pal["mag"] | curses.A_BOLD)
+            denom = total or 1.0
+            bx = ix
+            for value, key in ((oc, "acc"), (rx, "acc2"), (cn, "mag")):
+                seg = int(round(value / denom * iw))
+                if seg > 0 and bx < ix + iw:
+                    seg = min(seg, ix + iw - bx)
+                    put(win, y + 2, bx, G["bar"] * seg, pal[key])
+                    bx += seg
+            kv(y + 3, "OpenCode", _fmt(oc), pal["acc"] | curses.A_BOLD)
+            kv(y + 4, "Codex", _fmt(rx), pal["acc2"] | curses.A_BOLD)
+            kv(y + 5, "Cline", _fmt(cn), pal["mag"] | curses.A_BOLD)
+            return
+
+        p = period(payload)
+        put(win, y + 1, ix, _fmt(p["tokens_total"]), pal["acc"] | curses.A_BOLD)
+        sec = f"{p['messages']} requests" if tab == 1 else f"{p['sessions']} sessions"
+        put(win, y + 1, ix + max(0, iw - len(sec)), tui_fit(sec, iw // 2), pal["muted"])
+        spark(y + 2, payload)
+        yy = y + 3
+        if tab == 0:
+            kv(yy, "input", _fmt(p["ti"]))
+            kv(yy + 1, "output", _fmt(p["to"]))
+            kv(yy + 2, "cache", _fmt(p["cache"]))
+            kv(yy + 3, "cost", tui_fmt_cost(p["cost"]))
+            top_model(yy + 4, (payload or {}).get("models"))
+        elif tab == 1:
+            kv(yy, "ok", str(p["ok"]))
+            kv(yy + 1, "errors", str(p["err"]))
+            kv(yy + 2, "429s", str(p["err429"]))
+            kv(yy + 3, "what-if", tui_fmt_cost(p["what_if"]))
+            top_model(yy + 4, (payload or {}).get("models"))
+        else:
+            kv(yy, "requests", str(p["messages"]))
+            kv(yy + 1, "sessions", str(p["sessions"]))
+            kv(yy + 2, "cache", _fmt(p["cache"]))
+            top_model(yy + 3, (payload or {}).get("models"))
+
+    # ---------------------------------------------------------------- lists
+    def filtered_rows(tab):
+        q = state.get("filter") or ""
+        if tab == 0:
+            rows = (state["S"] or {}).get("sessions") or []
+            return tui_filter_sessions(rows, q, ("title", "model", "agent", "worktree"))
+        if tab == 1:
+            rows = (state["R"] or {}).get("requests") or []
+            return tui_filter_sessions(rows, q, ("model", "provider", "at", "status"))
+        if tab == 2:
+            rows = (state["C"] or {}).get("sessions") or []
+            return tui_filter_sessions(rows, q, ("title", "model", "provider", "id"))
+        return []
+
+    # --------------------------------------------------------------- modals
+    def _ts_label(ms):
+        try:
+            return datetime.fromtimestamp(num(ms) / 1000).strftime("%b %d %H:%M")
+        except Exception:
+            return "—"
+
+    def session_modal(row):
+        sid = str(row.get("id") or "")
+        lines = [
+            ("h", f"session {sid[:20]}"),
+            ("t", str(row.get("title") or "(untitled)")),
+            ("d", f"{router_short(row.get('model'))} {G['mid']} agent {row.get('agent') or 'default'} "
+                  f"{G['mid']} {row.get('worktree') or '—'}"),
+            ("d", f"{_ts_label(row.get('time_created'))} {G['mid']} "
+                  f"{num(row.get('duration_min', 0)):.1f} min {G['mid']} {row.get('msgs', 0)} messages"),
+            ("d", f"tokens {_fmt(row.get('tokens_total', 0))}  (in {_fmt(row.get('tokens_input', 0))}, "
+                  f"out {_fmt(row.get('tokens_output', 0))}, reason {_fmt(row.get('tokens_reasoning', 0))}, "
+                  f"cache {_fmt(row.get('tokens_cache', 0))})"),
+            ("d", f"cost {tui_fmt_cost(row.get('cost'))}"),
+        ]
+        files = ((state["S"] or {}).get("session_files") or {}).get(sid) or []
+        if files:
+            lines.append(("blank", ""))
+            lines.append(("h", "files touched"))
+            for f in files[:8]:
+                lines.append(("d", str(f)))
+        lines.append(("blank", ""))
+        lines.append(("h", "prompts"))
+        prompts = None
+        try:
+            con = connect(args.db)
+            try:
+                prompts = session_prompts(con, sid)
+            finally:
+                con.close()
+        except Exception as e:
+            lines.append(("d", f"(prompts unavailable: {e})"))
+        if prompts is not None:
+            if not prompts:
+                lines.append(("d", "(no prompts recorded for this session)"))
+            else:
+                for p in prompts[-12:]:
+                    lines.append(("k", _ts_label(p.get("t"))))
+                    lines.append(("", str(p.get("p") or "")))
+        return {"kind": "session", "title": "Session detail", "lines": lines, "scroll": 0}
+
+    def request_modal(row):
+        ok = bool(row.get("ok"))
+        lines = [
+            ("h", "request"),
+            ("t", str(row.get("model") or "—")),
+            ("d", str(row.get("at") or "—")),
+            ("d", f"provider {row.get('provider') or '—'} {G['mid']} status {row.get('status')} "
+                  f"({'ok' if ok else 'error'})"),
+            ("d", f"tokens {_fmt(row.get('total', 0))}  (in {_fmt(row.get('ti', 0))}, "
+                  f"out {_fmt(row.get('to', 0))}, cache {_fmt(row.get('cache', 0))})"),
+            ("d", f"duration {num(row.get('ms', 0)):.0f} ms"),
+        ]
+        return {"kind": "request", "title": "Request detail", "lines": lines, "scroll": 0}
+
+    def cline_modal(row):
+        lines = [
+            ("h", "cline session"),
+            ("t", str(row.get("title") or row.get("id") or "(session)")),
+            ("d", f"{router_short(row.get('model'))} {G['mid']} provider {row.get('provider') or 'cline'}"),
+            ("d", f"{row.get('msgs', 0)} messages {G['mid']} tokens {_fmt(row.get('tokens_total', 0))}"),
+            ("d", f"cache {_fmt(row.get('tokens_cache', 0))} {G['mid']} worktree {row.get('worktree') or '—'}"),
+            ("blank", ""),
+            ("d", "Cline keeps transcripts in its own app; prompts are not available here."),
+        ]
+        return {"kind": "cline", "title": "Cline session", "lines": lines, "scroll": 0}
+
+    def help_modal():
+        web = state["url"] if state["url"] else "unavailable (ports busy)"
+        bindings = [
+            ("q", "quit the TUI"),
+            ("r", "refresh all data (clears caches)"),
+            ("o / w", f"open Chrome UI: {web}"),
+            ("1-4, tab, arrows", "switch tabs"),
+            ("up/down, j/k", "move selection in lists"),
+            ("enter", "open the detail modal"),
+            ("/ then enter", "filter sessions (esc cancels)"),
+            ("t", "cycle range 14d / 30d / 90d / all"),
+            ("?", "this help"),
+            ("esc", "close modal / clear filter"),
+        ]
+        lines = [("h", "key bindings"), ("blank", "")]
+        for key, action in bindings:
+            lines.append(("k", key))
+            lines.append(("d", f"    {action}"))
+        return {"kind": "help", "title": "Help", "lines": lines, "scroll": 0}
+
+    def draw_modal(stdscr, pal):
+        m = state["modal"]
+        h, w = stdscr.getmaxyx()
+        if w < 30 or h < 10:
+            return
+        mw = min(max(30, w - 8), 92)
+        mh = min(max(8, h - 4), 26)
+        my = max(0, (h - mh) // 2)
+        mx = max(0, (w - mw) // 2)
+        iw = mw - 4
+        wrapped = []
+        for style, text in m.get("lines") or []:
+            if style == "blank":
+                wrapped.append(("blank", ""))
+                continue
+            for part in tui_wrap(text, iw) or [""]:
+                wrapped.append((style, part))
+        visible = max(1, mh - 4)
+        scroll = int(m.get("scroll") or 0)
+        scroll = max(0, min(scroll, max(0, len(wrapped) - visible)))
+        m["scroll"] = scroll
+        # clear the interior first so the page behind never bleeds through
+        fill(stdscr, my + 1, mx + 1, mh - 2, mw - 2, 0)
+        box(stdscr, (my, mx, mh, mw), m.get("title", ""),
+            pal["acc"] | curses.A_BOLD, pal["acc"] | curses.A_BOLD)
+        attrs = {"h": pal["acc"] | curses.A_BOLD, "t": pal["value"] | curses.A_BOLD,
+                 "k": pal["good"] | curses.A_BOLD}
+        for i in range(visible):
+            idx = scroll + i
+            if idx >= len(wrapped):
+                break
+            style, text = wrapped[idx]
+            if style == "blank":
+                continue
+            put(stdscr, my + 1 + i, mx + 2, tui_fit(text, iw),
+                attrs.get(style, pal["dim"]))
+        hint = "esc close"
+        if len(wrapped) > visible:
+            hint = (f"esc close {G['mid']} j/k scroll {G['mid']} "
+                    f"{scroll + 1}-{min(scroll + visible, len(wrapped))}/{len(wrapped)}")
+        put(stdscr, my + mh - 2, mx + 2, tui_fit(hint, iw), pal["muted"])
+
+    # ------------------------------------------------------------ page bodies
+    def draw_body(win, layout, tab, pal):
+        if tab == 0:
+            payload = state["S"]
+        elif tab == 1:
+            payload = state["R"]
+        else:
+            payload = state["C"]
+        days = TUI_RANGES[state["range_idx"]][1]
+        rng_label = TUI_RANGES[state["range_idx"]][0]
+        draw_cards(win, layout.get("cards") or [], build_cards(tab, pal), pal)
+        chart_rows = (payload or {}).get("days") or []
+        if days:
+            chart_rows = chart_rows[-days:]
+        if layout.get("chart"):
+            draw_chart(win, layout["chart"], chart_rows, pal, rng_label)
+        if layout.get("models"):
+            cost_idx = 12 if tab in (1, 2) else 7
+            draw_models(win, layout["models"], (payload or {}).get("models") or [],
+                        pal, cost_idx)
+        if layout.get("sessions"):
+            draw_table(win, layout["sessions"], tab, filtered_rows(tab), pal)
+        if layout.get("records"):
+            if tab == 0:
+                S = state["S"] or {}
+                draw_records(win, layout["records"], S.get("records") or {},
+                             S.get("activity") or [], pal)
+            else:
+                draw_side_panel(win, layout["records"], tab, pal)
+
+    # ----------------------------------------------------------------- draw
     def draw(stdscr):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        # colors
-        if not getattr(draw, "_init", False):
-            try:
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-                curses.init_pair(2, curses.COLOR_CYAN, -1)
-                curses.init_pair(3, curses.COLOR_YELLOW, -1)
-                curses.init_pair(4, curses.COLOR_GREEN, -1)
-                curses.init_pair(5, curses.COLOR_MAGENTA, -1)
-            except Exception:
-                pass
-            draw._init = True
-        H1 = curses.color_pair(1) | curses.A_BOLD
-        ACC = curses.color_pair(2) | curses.A_BOLD
-        WARN = curses.color_pair(3) | curses.A_BOLD
-        GOOD = curses.color_pair(4) | curses.A_BOLD
-        MAG = curses.color_pair(5) | curses.A_BOLD
-        DIM = curses.A_DIM
+        if render["pal"] is None:
+            render["pal"] = _init_palette()
+        pal = render["pal"]
+        BOLD = curses.A_BOLD
+        tab = state["tab"]
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        title = "  OpenCode Dashboard TUI"
-        _safe_addstr(stdscr, 0, 0, title.ljust(w - 1), H1)
-        _safe_addstr(stdscr, 0, max(1, w - len(now) - 2), now, H1)
+        # header
+        fill(stdscr, 0, 0, 1, w, pal["hdr"])
+        brand = G["dot"] + " OpenCode Dashboard"
+        clock = datetime.now().strftime("%a %d %b  %H:%M:%S")
+        clock_x = max(1, w - len(clock) - 2)
+        put(stdscr, 0, 1, brand, pal["hdr"] | BOLD)
+        subtitle = f"{G['mid']} usage observatory"
+        sub_x = 3 + len(brand)
+        if sub_x + len(subtitle) < clock_x - 1:
+            put(stdscr, 0, sub_x, subtitle, pal["hdr_dim"])
+        if clock_x > 1 + len(brand):
+            put(stdscr, 0, clock_x, clock, pal["hdr"] | BOLD)
 
+        layout = tui_layout(w, h)
+        state["mode"] = layout["mode"]
         # tab bar
-        x = 2
-        for i, t in enumerate(tabs):
-            label = f" {t} "
-            attr = ACC if i == state["tab"] else DIM
-            _safe_addstr(stdscr, 2, x, label, attr)
-            x += len(label) + 1
+        short = layout["mode"] == "compact" or w < 64
+        labels = ["OC", "CX", "CL", "RC"] if short else tabs
+        x = 1
+        for i, name in enumerate(labels):
+            text = f" {i + 1}{name} " if short else f" {i + 1} {name} "
+            if x + len(text) > w - 1:
+                break
+            attr = pal["tab"] | BOLD if i == tab else pal["muted"]
+            put(stdscr, 1, x, text, attr)
+            x += len(text) + 1
+        tabs_end = x
+        rng = TUI_RANGES[state["range_idx"]][0]
+        right = f"range {rng}"
+        live = f"{G['dot']} live"
+        live_x = max(1, w - len(live) - 1)
+        right_x = live_x - len(right) - 3
+        if w >= 48 and right_x >= tabs_end + 2:
+            put(stdscr, 1, right_x, right, pal["dim"])
+            if live_x >= right_x + len(right) + 2:
+                put(stdscr, 1, live_x, live, pal["good"] | BOLD)
+        elif w >= 20 and live_x >= tabs_end + 2:
+            put(stdscr, 1, live_x, live, pal["good"] | BOLD)
+        if state.get("filter") and w >= 48:
+            tag = f"filter:{tui_fit(state['filter'], 12, G['ell'])}"
+            tag_x = right_x - len(tag) - 2
+            if tag_x >= tabs_end + 2:
+                put(stdscr, 1, tag_x, tag, pal["warn"])
 
-        # separator
-        _safe_addstr(stdscr, 3, 0, "─" * (w - 1), DIM)
-
-        y = 5
-        S = state["S"]
-        R = state["R"]
-        C = state["C"]
-
-        def kpi(label, value, col=0):
-            nonlocal y
-            _safe_addstr(stdscr, y, 2, f"{label:<26}", DIM)
-            _safe_addstr(stdscr, y, 30, str(value), curses.A_BOLD)
-            y += 1
-
-        def fmt_cost(value):
-            c = num(value)
-            if c <= 0:
-                return "$0"
-            if c < 0.01:
-                return f"${c:.4f}"
-            return f"${c:,.2f}"
-
-        def draw_models(models, cost_idx, free_idx=None):
-            """Top-models block: name, tokens, cost and a free/$0 marker."""
-            nonlocal y
-            name_w = max(10, min(44, w - 38))
-            if y < h - 2:
-                _safe_addstr(
-                    stdscr, y, 4,
-                    f"{'model':<{name_w}} {'tokens':>9}  {'cost':>8}",
-                    DIM,
-                )
-                y += 1
-            for m in (models or [])[:8]:
-                if y >= h - 2:
-                    break
-                if isinstance(m, (list, tuple)):
-                    name = str(m[0]) if len(m) > 0 else "?"
-                    tot = m[2] if len(m) > 2 else 0
-                    cost = num(m[cost_idx]) if len(m) > cost_idx else 0.0
-                    is_free = bool(m[free_idx]) if free_idx is not None and len(m) > free_idx else False
-                else:
-                    name = str(m.get("name", "?"))
-                    tot = m.get("tokens_total", 0)
-                    cost = num(m.get("cost"))
-                    is_free = bool(m.get("free"))
-                if "free" in name.lower() or is_free:
-                    badge = " free"
-                elif num(cost) <= 0:
-                    badge = " $0"
-                else:
-                    badge = ""
-                row = (
-                    f"{name[:name_w]:<{name_w}} {_fmt(tot):>9}  "
-                    f"{fmt_cost(cost):>8}{badge}"
-                )
-                _safe_addstr(stdscr, y, 4, row, GOOD if badge else 0)
-                y += 1
-
-        if state["tab"] == 0:  # OpenCode
-            _safe_addstr(stdscr, y, 2, "OpenCode (local)", ACC)
-            y += 2
-            if not S:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No data", WARN)
-                y += 2
-            else:
-                t = S.get("totals", {})
-                kpi("Sessions", _fmt(t.get("sessions", 0)))
-                kpi("Messages", _fmt(t.get("messages", 0)))
-                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
-                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
-                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
-                kpi("Tokens (reasoning)", _fmt(t.get("tokens_reasoning", 0)))
-                kpi("Tokens (cache)", _fmt(t.get("tokens_cache_read", 0) + t.get("tokens_cache_write", 0)))
-                kpi("Cost (USD)", f"${t.get('cost', 0):.2f}")
-                kpi("Cache rate", f"{t.get('cache_rate', 0):.1f}%")
-                y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC)
-                y += 1
-                draw_models(S.get("models"), 7)
-                y += 1
-                _safe_addstr(stdscr, y, 2, "Recent days", ACC)
-                y += 1
-                for d_ in (S.get("days") or [])[-7:]:
-                    _safe_addstr(stdscr, y, 4, f"{d_.get('date')}  msgs={d_.get('msgs', 0):<5} tokens={_fmt(d_.get('total', 0))}", 0)
-                    y += 1
-                    if y >= h - 4:
-                        break
-
-        elif state["tab"] == 1:  # Codex/router
-            _safe_addstr(stdscr, y, 2, "Codex Router", ACC)
-            y += 2
-            if not R:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No router data", WARN)
-                y += 2
-            else:
-                t = R.get("totals", {})
-                kpi("Requests", _fmt(t.get("requests", 0)))
-                kpi("OK", _fmt(t.get("ok", 0)))
-                kpi("Errors", _fmt(t.get("errors", 0)))
-                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
-                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
-                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
-                kpi("What-if cost", f"${t.get('what_if_cost', 0):.2f}")
-                y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC)
-                y += 1
-                draw_models(R.get("models"), 12, 11)
-
-        elif state["tab"] == 2:  # Cline
-            _safe_addstr(stdscr, y, 2, "Cline Desktop", ACC)
-            y += 2
-            if not C:
-                _safe_addstr(stdscr, y, 2, state["msg"] or "No cline data", WARN)
-                y += 2
-            else:
-                t = C.get("totals", {})
-                kpi("Requests", _fmt(t.get("requests", 0)))
-                kpi("Sessions", _fmt(t.get("sessions", 0)))
-                kpi("Tokens (total)", _fmt(t.get("tokens_total", 0)))
-                kpi("Tokens (input)", _fmt(t.get("tokens_input", 0)))
-                kpi("Tokens (output)", _fmt(t.get("tokens_output", 0)))
-                kpi("Tokens (cache)", _fmt(t.get("tokens_cache_read", 0) + t.get("tokens_cache_write", 0)))
-                y += 1
-                _safe_addstr(stdscr, y, 2, "Top models", ACC)
-                y += 1
-                draw_models(C.get("models"), 12, 11)
-
-        else:  # Recap
-            _safe_addstr(stdscr, y, 2, "Recap (all harnesses)", ACC)
-            y += 2
-            oc = (S.get("totals", {}).get("tokens_total", 0) if S else 0)
-            rx = (R.get("totals", {}).get("tokens_total", 0) if R else 0)
-            cx = (C.get("totals", {}).get("tokens_total", 0) if C else 0)
-            total = oc + rx + cx
-            _safe_addstr(stdscr, y, 2, f"TOTAL TOKENS: {_fmt(total)}", MAG)
-            y += 2
-            kpi("OpenCode", _fmt(oc))
-            kpi("Codex", _fmt(rx))
-            kpi("Cline", _fmt(cx))
-            y += 1
-            _safe_addstr(stdscr, y, 2, "Open traditional Chrome UI for full charts: press 'o'", DIM)
-            y += 1
+        # body
+        if layout["mode"] == "compact":
+            draw_compact(stdscr, w, h, pal)
+        elif tab == 3:
+            # cap the recap card so a tall terminal is not a mostly-empty box
+            draw_recap(stdscr, 3, 1, min(max(3, h - 5), 17), w - 2, pal)
+        else:
+            draw_body(stdscr, layout, tab, pal)
 
         # footer
-        if state["url"]:
-            _safe_addstr(stdscr, h - 3, 0, f" Chrome UI: {state['url']}  (o opens it)", ACC)
-            open_hint = "o open Chrome UI"
+        put(stdscr, h - 2, 0, G["h"] * max(0, w - 1), pal["muted"])
+        parts = ["q quit", "r refresh", "o web UI", "t range", "/ search", "? help"]
+        if w >= 100:
+            parts[2] = f"o {state['url']}" if state["url"] else "o web UI off"
+        elif w < 80:
+            # 70-79 cols: the full hint list does not fit on one line
+            parts = ["q quit", "r refresh", "t range", "/ search", "? help"]
+        if w < 36:
+            parts = ["q quit", "? help"]
+        elif w < 64:
+            parts = ["q quit", "r refresh", "? help"]
+        hints = " " + G["sep"].join(parts) + " "
+        msg = state.get("msg") or ""
+        searching = state.get("search") is not None
+        if searching:
+            msg = f"/ {state['search']}_   enter apply {G['mid']} esc cancel"
+            attr = pal["warn"]
+        elif state["loading"]:
+            spin = G["spin"][state["spinner"] % len(G["spin"])]
+            msg = f"{spin} refreshing…"
+            attr = pal["acc"]
+        elif state.get("filter"):
+            msg = f"filter: {tui_fit(state['filter'], 18, G['ell'])} {G['mid']} esc clears"
+            attr = pal["warn"]
         else:
-            open_hint = "o unavailable"
-        foot = f" q quit | r refresh | 1-4 tabs | {open_hint} | arrows/tab switch "
-        _safe_addstr(stdscr, h - 2, 0, "─" * (w - 1), DIM)
-        _safe_addstr(stdscr, h - 1, 0, foot[: w - 1], DIM)
-        _safe_addstr(stdscr, h - 1, max(0, w - len(state["msg"]) - 1), state["msg"][: w - 1], GOOD)
+            attr = pal["good"]
+        if msg:
+            right_x = w - len(msg) - 2
+            if not searching and right_x >= len(hints) + 1:
+                put(stdscr, h - 1, 0, hints, pal["muted"])
+                put(stdscr, h - 1, right_x, msg, attr)
+            elif searching or attr != pal["good"]:
+                # status/search replaces the hints so nothing overlaps
+                put(stdscr, h - 1, 1, tui_fit(msg, w - 2), attr)
+            else:
+                put(stdscr, h - 1, 0, hints, pal["muted"])
+        else:
+            put(stdscr, h - 1, 0, hints, pal["muted"])
 
+        if state["modal"] is not None:
+            draw_modal(stdscr, pal)
         stdscr.refresh()
+
+    def draw_loading(stdscr):
+        if render["pal"] is None:
+            render["pal"] = _init_palette()
+        pal = render["pal"]
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        fill(stdscr, 0, 0, 1, w, pal["hdr"])
+        brand = G["dot"] + " OpenCode Dashboard"
+        put(stdscr, 0, 1, brand, pal["hdr"] | curses.A_BOLD)
+        clock = datetime.now().strftime("%H:%M:%S")
+        put(stdscr, 0, max(1, w - len(clock) - 2), clock, pal["hdr"] | curses.A_BOLD)
+        spin = G["spin"][state["spinner"] % len(G["spin"])]
+        msg = f"{spin} Loading dashboard…"
+        put(stdscr, max(0, h // 2), max(1, (w - len(msg)) // 2), msg,
+            pal["acc"] | curses.A_BOLD)
+        put(stdscr, max(0, h // 2 + 2), max(1, (w - 40) // 2),
+            "reading OpenCode, Codex and Cline data", pal["muted"])
+        stdscr.refresh()
+
+    # --------------------------------------------------------------- actions
+    def cycle_range():
+        state["range_idx"] = (state["range_idx"] + 1) % len(TUI_RANGES)
+
+    def move_sel(delta):
+        tab = state["tab"]
+        rows = filtered_rows(tab)
+        if not rows:
+            state["sel"][tab] = 0
+            return
+        sel = state["sel"][tab] + delta
+        state["sel"][tab] = max(0, min(sel, len(rows) - 1))
+
+    def open_detail():
+        tab = state["tab"]
+        if tab == 3:
+            state["msg"] = "recap has no detail view"
+            return
+        if state.get("mode") == "compact":
+            state["msg"] = "session list hidden at this size — resize for details"
+            return
+        rows = filtered_rows(tab)
+        if not rows:
+            state["msg"] = "nothing to open"
+            return
+        idx = max(0, min(state["sel"][tab], len(rows) - 1))
+        row = rows[idx]
+        try:
+            if tab == 0:
+                state["modal"] = session_modal(row)
+            elif tab == 1:
+                state["modal"] = request_modal(row)
+            else:
+                state["modal"] = cline_modal(row)
+        except Exception as e:
+            state["modal"] = {
+                "kind": "error", "title": "Detail", "scroll": 0,
+                "lines": [("t", "Could not open detail"), ("d", str(e))],
+            }
+
+    def refresh_now(stdscr):
+        state["loading"] = True
+        state["spinner"] = (state["spinner"] + 1) % 4
+        clear_caches()
+        draw(stdscr)
+        load_data()
+        state["loading"] = False
 
     def main_loop(stdscr):
         curses.curs_set(0)
         stdscr.timeout(200)
+        try:
+            stdscr.keypad(True)
+        except Exception:
+            pass
+        try:
+            # keep a lone Esc snappy instead of waiting out ncurses' ESCDELAY
+            curses.set_escdelay(25)
+        except Exception:
+            pass
+        pending = []  # keys read while disambiguating Esc, replayed on the next loop
+
+        def take_key():
+            if pending:
+                return pending.pop(0)
+            try:
+                return stdscr.getch()
+            except Exception:
+                return -1
+
+        def arrow_from_esc():
+            """Decode CSI/SS3 arrow sequences curses left undecoded.
+
+            Terminals that do not honour application-keypad mode send
+            ESC [ A..D even with keypad(True); map those so Up/Down and
+            Left/Right keep working there. A real lone Esc still returns -1.
+            """
+            stdscr.timeout(40)
+            try:
+                nxt = stdscr.getch()
+                if nxt in (ord("["), ord("O")):
+                    third = stdscr.getch()
+                    arrow = {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN,
+                             ord("C"): curses.KEY_RIGHT, ord("D"): curses.KEY_LEFT}.get(third)
+                    if arrow is not None:
+                        return arrow
+                    pending.extend([nxt] + ([third] if third != -1 else []))
+                elif nxt != -1:
+                    pending.append(nxt)
+            except Exception:
+                pass
+            finally:
+                stdscr.timeout(200)
+            return -1
+
+        draw_loading(stdscr)
         load_data()
         while True:
             draw(stdscr)
-            try:
-                key = stdscr.getch()
-            except Exception:
-                key = -1
+            key = take_key()
+            if key == 27:
+                arrow = arrow_from_esc()
+                if arrow != -1:
+                    key = arrow
             if key == -1:
                 if time.time() - state["last"] > 30:
-                    load_data()
+                    refresh_now(stdscr)
+                continue
+            if state["search"] is not None:
+                if key == 27:
+                    state["search"] = None
+                elif key in (10, 13, curses.KEY_ENTER):
+                    state["filter"] = state["search"]
+                    state["search"] = None
+                    state["sel"][state["tab"]] = 0
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    state["search"] = state["search"][:-1]
+                elif 32 <= key < 127 and len(state["search"]) < 40:
+                    state["search"] += chr(key)
+                continue
+            if state["modal"] is not None:
+                m = state["modal"]
+                if key == 27 or key in (ord("q"), ord("Q")):
+                    state["modal"] = None
+                elif key in (curses.KEY_UP, ord("k")):
+                    m["scroll"] = max(0, int(m.get("scroll") or 0) - 1)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    m["scroll"] = int(m.get("scroll") or 0) + 1
+                elif key == curses.KEY_PPAGE:
+                    m["scroll"] = max(0, int(m.get("scroll") or 0) - 8)
+                elif key == curses.KEY_NPAGE:
+                    m["scroll"] = int(m.get("scroll") or 0) + 8
                 continue
             if key in (ord("q"), ord("Q")):
                 break
             if key in (ord("r"), ord("R")):
-                with LOCK:
-                    LOCAL_CACHE.clear()
-                    ROUTER_CACHE.clear()
-                    CLINE_CACHE.clear()
-                load_data()
+                refresh_now(stdscr)
             elif key in (ord("o"), ord("O"), ord("w"), ord("W")):
                 if not state["url"]:
-                    state["msg"] = (
-                        f"Chrome UI unavailable: no free port at "
-                        f"{args.port}-{args.port + 10}"
-                    )
+                    state["msg"] = f"Chrome UI unavailable: no free port at {args.port}-{args.port + 10}"
                 else:
                     try:
                         if open_chrome_window(state["url"]):
-                            state["msg"] = f"Opened {state['url']}"
+                            state["msg"] = f"opened {state['url']}"
                         else:
-                            state["msg"] = f"Could not open a browser for {state['url']}"
+                            state["msg"] = f"could not open a browser for {state['url']}"
                     except Exception as e:
-                        state["msg"] = f"Open failed: {e}"
+                        state["msg"] = f"open failed: {e}"
+            elif key in (ord("t"), ord("T")):
+                cycle_range()
+            elif key == ord("?"):
+                state["modal"] = help_modal()
+            elif key == ord("/"):
+                state["search"] = ""
             elif key in (9, curses.KEY_RIGHT):
                 state["tab"] = (state["tab"] + 1) % len(tabs)
             elif key == curses.KEY_LEFT:
                 state["tab"] = (state["tab"] - 1) % len(tabs)
             elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
                 state["tab"] = key - ord("1")
+            elif key in (curses.KEY_UP, ord("k")):
+                move_sel(-1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                move_sel(1)
+            elif key == curses.KEY_PPAGE:
+                move_sel(-8)
+            elif key == curses.KEY_NPAGE:
+                move_sel(8)
+            elif key == curses.KEY_HOME:
+                move_sel(-(10 ** 9))
+            elif key == curses.KEY_END:
+                move_sel(10 ** 9)
+            elif key in (10, 13, curses.KEY_ENTER):
+                open_detail()
+            elif key == 27 and state.get("filter"):
+                state["filter"] = ""
 
     try:
         curses.wrapper(main_loop)
@@ -5061,7 +6466,6 @@ def run_tui(args):
                 srv_thread.join(timeout=2)
         except Exception:
             pass
-
 
 def main():
     parser = argparse.ArgumentParser(description="OpenCode usage dashboard")

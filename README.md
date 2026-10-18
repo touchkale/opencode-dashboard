@@ -13,7 +13,7 @@
 - **Token-first**: every chart, bar and heatmap shows tokens used — Input vs Output (incl. reasoning) vs Cache — with day-vs-day and model-vs-model comparisons.
 - **OpenCode 1.0 + 2.0 schemas**: reads `session`/`message` (1.0) or `session_v2`/`session_message` (2.0) automatically, so a database carrying both generations still reports consistent session, per-day and per-file token totals.
 - **Leak-proof token history**: a persistent per-database ledger (`opencode.db.usage-ledger.sqlite`) records every session's tokens, so totals, per-day counts, the heatmap, the model/agent/project breakdowns and records survive chat deletion inside OpenCode (only the recent-sessions table stays live-only).
-- **Terminal UI**: `--tui` runs a curses dashboard with the same OpenCode / Codex / Cline / Recap data, refresh (`r`), tab switching (`1-4`, Tab/arrows) and `o` to pop open the traditional Chrome app window.
+- **Terminal UI**: `--tui` runs a responsive curses dashboard with the same OpenCode / Codex / Cline / Recap data — rounded KPI cards, a sparkline-bar activity chart, top models with `free` / `$0` badges, a scrollable list, search (`/`), a detail modal (`Enter`), range switching (`t`), help (`?`), refresh (`r`), tab switching (`1-4`, Tab/arrows) and `o` to pop open the traditional Chrome app window.
 - **Four tabs**: **OpenCode** (local SQLite), **Codex** (router `usage-events.jsonl`), **Cline** (Desktop app `~/.cline/data` sessions, same KPIs as Codex), and **Recap** — a recording-friendly daily total across all harnesses with per-harness split, providers, and top conversations for your YT Shorts.
 - **Harness toggles**: the ⚙ Harnesses menu lets you disable any harness you are not using — its tab hides and Recap excludes it (persisted in `localStorage`).
 - **Auto-refreshing** (30s, paused in background tabs); shows Today/7d/30d summary, per-day stacked token bars, tokens by file/subsystem, tokens per git commit, model universal comparison, records, and a GitHub-style **52-week token heatmap**.
@@ -48,19 +48,42 @@ TUI (`q` / closing the terminal) does.
 
 ### Terminal UI (`--tui`)
 
+A responsive curses dashboard: header with a live clock, tab bar with the active time
+range, a row of rounded KPI cards (tokens, sessions, cost, activity), a token-activity
+chart drawn with sparkline-style bars, top models with `free` / `$0` badges, a scrollable
+session/request table, and — on the OpenCode tab — a 52-week token heatmap with records.
+Codex and Cline replace the heatmap with rate-limit / provider insights. The footer shows
+the key hints and the live `Chrome UI: <url>` address.
+
 | Key | Action |
 |-----|--------|
 | `q` | quit the TUI (stops the background server) |
-| `r` | refresh all data |
+| `r` | refresh all data (clears the stats caches) |
 | `o` / `w` | open the traditional Chrome app window |
 | `1`-`4` | jump to OpenCode / Codex / Cline / Recap |
 | `Tab` / `→` / `←` | cycle tabs |
+| `↑` / `↓` (or `j` / `k`) | move the list selection; `PgUp`/`PgDn`/`Home`/`End` jump |
+| `Enter` | open the detail modal for the selected session / request / Cline session (scroll with `j` / `k`, close with `Esc` or `q`) |
+| `/` | filter the list by title/model (type, `Enter` applies, `Esc` cancels; `Esc` again clears the filter) |
+| `t` | cycle the time range 14d / 30d / 90d / all — cards, chart and recap follow it |
+| `?` | help modal with every binding |
+| `Esc` | close a modal, cancel a search, or clear an active filter |
+
+The layout adapts to the terminal size instead of overlapping: at ≥110×30 the KPI cards,
+chart + top models, and sessions + heatmap/records are side by side; at ≥84×26 the chart
+row is side by side and the table spans the width; narrower terminals stack cards, chart,
+top models and the session table; below 60 columns or 20 rows the TUI falls back to one
+compact card with a sparkline. Panels are dropped as space runs out — never clipped or
+drawn over each other.
 
 The TUI footer shows the live `Chrome UI: <url>` address. If the requested port is busy,
 the server walks forward through the next 10 ports (`--port`+1 … `--port`+10); if none
 bind, the TUI still runs and `o` reports that the Chrome UI is unavailable. Top-model rows
-show tokens, cost (the session cost for OpenCode, the what-if paid cost for Codex), and a
-`free` / `$0` marker for free or zero-cost models.
+show tokens, cost, and a `free` / `$0` marker. The cost column is the session cost for
+OpenCode and the what-if paid cost for Codex; Cline records no per-model cost, so its rows
+read `$0`. `free` is shown when the model name contains `free` or the payload flags it
+free, and `$0` only when that tab's cost is actually zero. The cost column is dropped on
+very narrow layouts, keeping the badge.
 
 ### Options
 
