@@ -4,7 +4,7 @@ Pure-function coverage only: no curses, no database, no network.  Every test
 that involves dates passes an explicit ``today`` so the result is stable.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import pytest
 
