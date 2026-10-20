@@ -43,9 +43,9 @@ MAX_SESSION_ROWS = 500
 ACTIVITY_DAYS = 364  # 52 weeks of daily cells, one column per day
 COMMIT_WINDOW_HOURS = 24  # sessions in this window before a commit count toward it
 MAX_COMMITS_PER_REPO = 200  # recent commits scanned per worktree
-MAX_FILE_ROWS = 15  # top files/subsystems kept in the payload (+ implicit Other)
+MAX_FILE_ROWS = 15  # top files/subsystems kept in the payload
 MAX_COMMIT_ROWS = 60  # commit rows kept in the payload, by tokens desc
-RECOVERED_OPENCODE_TOKENS = 4_500_000_000  # deleted OpenCode history, attributed to "Other"
+RECOVERED_OPENCODE_TOKENS = 4_500_000_000  # deleted OpenCode history, lifetime metadata only
 RECOVERED_TOKENS = None  # CLI setting: None = auto (default DB only), 0 = off, >0 explicit
 
 
@@ -375,14 +375,55 @@ def query_stats(con):
         ).fetchone()
     )
 
-    # Single pass over step-finish parts: per-day token totals.
-    # Part 'total' = input+output+reasoning+cache.read+cache.write, so the
-    # derived cache (total-input-output-reasoning) is read+write combined,
-    # matching the session rollups exactly.
-    tokens_by_day = {}
+    totals["tokens_cache_total"] = (
+        (totals.get("tokens_cache_read") or 0)
+        + (totals.get("tokens_cache_write") or 0)
+    )
+
+    # Session rows are the source of truth for tokens.  Build a complete
+    # rollup map first so every session can be attributed to dates below.
+    session_roll = {}
     for r in con.execute(
         f"""
-        SELECT time_created, data FROM part
+        SELECT id, time_created,
+               COALESCE(tokens_input,0) AS ti,
+               COALESCE(tokens_output,0) AS to_,
+               COALESCE(tokens_reasoning,0) AS tr,
+               COALESCE(tokens_cache_read,0) AS cr,
+               COALESCE(tokens_cache_write,0) AS cw,
+               COALESCE(cost,0) AS cost
+        FROM {ST}
+        """
+    ):
+        session_roll[r["id"]] = {
+            "start": r["time_created"] or 0,
+            "start_day": _day(r["time_created"] or 0),
+            "ti": num(r["ti"]),
+            "to": num(r["to_"]),
+            "tr": num(r["tr"]),
+            "cr": num(r["cr"]),
+            "cw": num(r["cw"]),
+            "cost": num(r["cost"]),
+        }
+        session_roll[r["id"]]["total"] = (
+            session_roll[r["id"]]["ti"]
+            + session_roll[r["id"]]["to"]
+            + session_roll[r["id"]]["tr"]
+            + session_roll[r["id"]]["cr"]
+            + session_roll[r["id"]]["cw"]
+        )
+
+    def token_total(entry):
+        return (entry["ti"] + entry["to"] + entry["tr"]
+                + entry["cr"] + entry["cw"])
+
+    # Parts first: one pass over step-finish parts, grouped per session.  A
+    # nested cache object is authoritative (read+write); only when neither
+    # nested field exists do we fall back to total-input-output-reasoning.
+    session_parts = defaultdict(list)
+    for r in con.execute(
+        f"""
+        SELECT session_id, time_created, data FROM part
         WHERE json_extract(data,'$.type')='step-finish'
           AND session_id IN (SELECT id FROM {ST})
         """
@@ -396,21 +437,166 @@ def query_stats(con):
         to = num(t.get("output"))
         tr = num(t.get("reasoning"))
         tt = num(t.get("total"))
-        cr = num((t.get("cache") or {}).get("read"))
-        cost = num(data.get("cost"))
-        ms = r["time_created"]
-        day = _day(ms)
-        if not day:
-            continue
-        cache = max(0.0, tt - ti - to - tr) or cr
-        entry = tokens_by_day.setdefault(
-            day, {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "cost": 0.0}
+        cache_obj = t.get("cache")
+        if isinstance(cache_obj, dict) and (
+            "read" in cache_obj or "write" in cache_obj
+        ):
+            cr = num(cache_obj.get("read"))
+            cw = num(cache_obj.get("write"))
+        else:
+            # Legacy parts only carry 'total'; treat the derived cache as
+            # read tokens so the read-hit-rate basis stays meaningful.
+            cr = max(0.0, tt - ti - to - tr)
+            cw = 0.0
+        sid = r["session_id"]
+        start_day = session_roll.get(sid, {}).get("start_day")
+        session_parts[sid].append(
+            {
+                "day": _day(r["time_created"]) or start_day,
+                "ti": ti,
+                "to": to,
+                "tr": tr,
+                "cr": cr,
+                "cw": cw,
+                "cost": num(data.get("cost")),
+            }
         )
-        entry["ti"] += ti
-        entry["to"] += to
-        entry["tr"] += tr
-        entry["cache"] += cache
-        entry["cost"] += cost
+
+    # Incomplete sessions need message-level tokens.  Compute part coverage
+    # first; only those sessions are queried, in chunks, so the 5.9GB
+    # message table is never fully scanned.
+    incomplete = []
+    for sid, roll in session_roll.items():
+        covered = sum(token_total(e) for e in session_parts.get(sid, []))
+        if covered < roll["total"] - 0.5:
+            incomplete.append(sid)
+
+    session_messages = defaultdict(list)
+    if incomplete and MT == "session_message":
+        CHUNK = 400
+        for i in range(0, len(incomplete), CHUNK):
+            chunk = incomplete[i:i + CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            for r in con.execute(
+                f"""
+                SELECT session_id, time_created, data
+                FROM session_message
+                WHERE session_id IN ({placeholders}) AND type='assistant'
+                """,
+                chunk,
+            ):
+                try:
+                    data = json.loads(r["data"])
+                except (ValueError, TypeError):
+                    continue
+                t = data.get("tokens") or {}
+                if not isinstance(t, dict) or not t:
+                    continue
+                ti = num(t.get("input"))
+                to = num(t.get("output"))
+                tr = num(t.get("reasoning"))
+                tt = num(t.get("total"))
+                cache_obj = t.get("cache")
+                if isinstance(cache_obj, dict) and (
+                    "read" in cache_obj or "write" in cache_obj
+                ):
+                    cr = num(cache_obj.get("read"))
+                    cw = num(cache_obj.get("write"))
+                else:
+                    cr = max(0.0, tt - ti - to - tr)
+                    cw = 0.0
+                if not (ti or to or tr or cr or cw):
+                    continue
+                sid = r["session_id"]
+                start_day = session_roll.get(sid, {}).get("start_day")
+                session_messages[sid].append(
+                    {
+                        "day": _day(r["time_created"]) or start_day,
+                        "ti": ti,
+                        "to": to,
+                        "tr": tr,
+                        "cr": cr,
+                        "cw": cw,
+                        "cost": 0.0,
+                    }
+                )
+
+    tokens_by_day = {}
+    unattributed = 0.0
+
+    def add_day_tokens(day, entry):
+        bucket = tokens_by_day.setdefault(
+            day,
+            {"ti": 0.0, "to": 0.0, "tr": 0.0, "cr": 0.0, "cw": 0.0,
+             "cost": 0.0},
+        )
+        for key in ("ti", "to", "tr", "cr", "cw", "cost"):
+            bucket[key] += entry.get(key, 0.0)
+
+    for sid, roll in session_roll.items():
+        entries = [dict(e) for e in session_parts.get(sid, [])]
+        target = roll["total"]
+        part_covered = sum(token_total(e) for e in entries)
+
+        # Fill part gaps with assistant-message tokens by message date.  The
+        # message stream can describe the whole session, so cap it at the
+        # part residual rather than double-counting already attributed tokens.
+        if part_covered < target - 0.5 and session_messages.get(sid):
+            room = target - part_covered
+            msgs = session_messages[sid]
+            msg_total = sum(token_total(e) for e in msgs)
+            factor = min(1.0, room / msg_total) if msg_total > 0 else 0.0
+            for e in msgs:
+                scaled = {k: e.get(k, 0.0) * factor for k in
+                          ("ti", "to", "tr", "cr", "cw", "cost")}
+                scaled["day"] = e["day"]
+                entries.append(scaled)
+
+        attributed = sum(token_total(e) for e in entries)
+        if attributed > target and attributed > 0:
+            factor = target / attributed
+            for e in entries:
+                for key in ("ti", "to", "tr", "cr", "cw", "cost"):
+                    e[key] = e.get(key, 0.0) * factor
+            attributed = sum(token_total(e) for e in entries)
+
+        missing = target - attributed
+        if missing > 0.5 or (not entries and target > 0):
+            used = {
+                key: sum(e.get(key, 0.0) for e in entries)
+                for key in ("ti", "to", "tr", "cr", "cw")
+            }
+            residual = {
+                key: max(0.0, roll[key] - used[key])
+                for key in ("ti", "to", "tr", "cr", "cw")
+            }
+            residual_sum = sum(residual.values())
+            if missing > 0.5:
+                if residual_sum > 0:
+                    scale = missing / residual_sum
+                    for key in residual:
+                        residual[key] *= scale
+                else:
+                    residual["ti"] = missing
+            else:
+                residual = {key: 0.0 for key in residual}
+            dated = [e["day"] for e in entries if e.get("day")]
+            day = max(dated) if dated else roll["start_day"]
+            cost_missing = roll["cost"] - sum(
+                e.get("cost", 0.0) for e in entries
+            )
+            residual["day"] = day
+            residual["cost"] = cost_missing
+            entries.append(residual)
+
+        for entry in entries:
+            if not token_total(entry) and not entry.get("cost"):
+                continue
+            day = entry.get("day")
+            if not day:
+                unattributed += token_total(entry)
+                continue
+            add_day_tokens(day, entry)
 
     # One scan of the message table gives per-day counts plus the legacy
     # per-hour message intensity series.
@@ -421,7 +607,7 @@ def query_stats(con):
         SELECT date(time_created/1000,'unixepoch','localtime') AS d,
                CAST(strftime('%H',time_created/1000,'unixepoch','localtime') AS INTEGER) AS h,
                COUNT(*) AS c
-        FROM {MT} GROUP BY d,h
+        FROM {MT} WHERE time_created > 0 GROUP BY d,h
         """
     ):
         day_msgs[r["d"]] += r["c"]
@@ -429,7 +615,7 @@ def query_stats(con):
 
     day_sessions = defaultdict(int)
     for r in con.execute(
-        f"SELECT date(time_created/1000,'unixepoch','localtime') AS d, COUNT(*) AS c FROM {ST} GROUP BY d"
+        f"SELECT date(time_created/1000,'unixepoch','localtime') AS d, COUNT(*) AS c FROM {ST} WHERE time_created > 0 GROUP BY d"
     ):
         day_sessions[r["d"]] = r["c"]
 
@@ -441,14 +627,15 @@ def query_stats(con):
         agents[a]["n"] += r["n"]
         agents[a]["toks"] += r["t"]
 
-    models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0})
+    models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cr": 0, "cost": 0})
     for r in con.execute(
         f"""
         SELECT model, COUNT(*) AS n,
                 COALESCE(SUM(tokens_input),0) AS ti,
                 COALESCE(SUM(tokens_output),0) AS to_,
                 COALESCE(SUM(tokens_reasoning),0) AS tr,
-                COALESCE(SUM(tokens_cache_read),0)+COALESCE(SUM(tokens_cache_write),0) AS ca,
+                COALESCE(SUM(tokens_cache_read),0) AS cr,
+                COALESCE(SUM(tokens_cache_write),0) AS cw,
                 COALESCE(SUM(cost),0) AS cost
         FROM {ST} GROUP BY model
         """
@@ -458,7 +645,8 @@ def query_stats(con):
         models[m]["ti"] += r["ti"]
         models[m]["to"] += r["to_"]
         models[m]["tr"] += r["tr"]
-        models[m]["cache"] += r["ca"]
+        models[m]["cache"] += (r["cr"] or 0) + (r["cw"] or 0)
+        models[m]["cr"] += r["cr"] or 0
         models[m]["cost"] += r["cost"]
 
     # Most recent sessions only — the payload stays bounded and the detail
@@ -604,15 +792,25 @@ def query_stats(con):
     commit_sessions = {k: v for k, v in commit_sessions.items() if k in keep_shas}
 
     days = sorted(set(day_msgs) | set(day_sessions) | set(tokens_by_day))
-    day_entries = [
-        {
-            "date": d,
-            "msgs": day_msgs.get(d, 0),
-            "sessions": day_sessions.get(d, 0),
-            **{k: round(v, 4) for k, v in tokens_by_day.get(d, {"ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0}).items()},
-        }
-        for d in days
-    ]
+    day_entries = []
+    for d in days:
+        tok = tokens_by_day.get(d, {})
+        cache_read = tok.get("cr", 0.0)
+        cache_write = tok.get("cw", 0.0)
+        day_entries.append(
+            {
+                "date": d,
+                "msgs": day_msgs.get(d, 0),
+                "sessions": day_sessions.get(d, 0),
+                "ti": round(tok.get("ti", 0.0), 4),
+                "to": round(tok.get("to", 0.0), 4),
+                "tr": round(tok.get("tr", 0.0), 4),
+                "cache": round(cache_read + cache_write, 4),
+                "cache_read": round(cache_read, 4),
+                "cache_write": round(cache_write, 4),
+                "cost": round(tok.get("cost", 0.0), 4),
+            }
+        )
     for e in day_entries:
         e["total"] = round(e["ti"] + e["to"] + e["tr"] + e["cache"], 1)
     activity = pad_activity(day_entries)
@@ -626,6 +824,10 @@ def query_stats(con):
                     + totals["tokens_reasoning"] + totals["tokens_cache_read"]
                     + totals["tokens_cache_write"])
     totals["tokens_total"] = total_tokens
+    totals["tokens_cache_total"] = (
+        totals["tokens_cache_read"] + totals["tokens_cache_write"]
+    )
+    totals["unattributed"] = round(unattributed, 1)
     totals["cache_rate"] = cache_rate(totals["tokens_input"], totals["tokens_cache_read"])
     totals["avg_tokens_per_session"] = round(total_tokens / totals["sessions"], 0) if totals["sessions"] else 0
 
@@ -705,7 +907,7 @@ def query_stats(con):
         model_rows.append(
             [k, v["n"], tot, v["ti"], v["to"], v["tr"], v["cache"], v["cost"],
              round(tot / v["n"], 0) if v["n"] else 0,
-             cache_rate(v["ti"], v["cache"])]
+             cache_rate(v["ti"], v["cr"])]
         )
     model_rows.sort(key=lambda kv: -kv[2])
 
@@ -760,7 +962,9 @@ ZERO_TOTALS = {
     "tokens_reasoning": 0,
     "tokens_cache_read": 0,
     "tokens_cache_write": 0,
+    "tokens_cache_total": 0,
     "tokens_total": 0,
+    "unattributed": 0,
     "cache_rate": 0.0,
     "avg_tokens_per_session": 0,
     "cost": 0,
@@ -921,11 +1125,17 @@ def ledger_set_pref(db_path, key, value):
 def sync_session_ledger(db_path, con):
     """Upsert every session currently in the OpenCode DB into the persistent
     ledger. Sessions that disappear from the source DB are retained (marked
-    deleted) so their tokens are never lost."""
+    deleted) so their tokens are never lost.
+
+    Returns True only when the session source was read successfully.  A failed
+    or interrupted query returns False and leaves existing ledger rows alone,
+    so the caller can skip the merge instead of resurrecting stale data.
+    """
     try:
         lcon = ledger_connect(db_path)
     except Exception:
-        return
+        return False
+    ok = True
     try:
         ST = session_table(con)
         MT = message_table(con)
@@ -953,6 +1163,7 @@ def sync_session_ledger(db_path, con):
             ).fetchall()
         except sqlite3.Error:
             query_failed = True
+            ok = False
         now = int(time.time() * 1000)
         cur_ids = []
         for r in rows:
@@ -997,12 +1208,13 @@ def sync_session_ledger(db_path, con):
                 lcon.execute("UPDATE session_usage SET deleted=1")
         lcon.commit()
     except Exception:
-        pass
+        ok = False
     finally:
         try:
             lcon.close()
         except Exception:
             pass
+    return ok
 
 
 def ledger_totals(db_path):
@@ -1043,24 +1255,42 @@ def ledger_totals(db_path):
             pass
 
 
-def ledger_day_tokens(db_path):
+def ledger_day_tokens(db_path, deleted_only=False):
     """Per-day ledger rollup: tokens/cost plus session and message counts.
 
     Days are keyed like everywhere else ('YYYY-MM-DD' local time, from each
-    ledger session's creation time), so callers can overwrite live per-day
-    rows after chats are deleted without changing shape.
+    ledger session's creation time).  With ``deleted_only=True`` only rows that
+    are marked deleted *or* no longer exist in the source DB are included, so
+    the merge adds historical deltas without re-attributing live activity.
     """
     out = {}
+    live_ids = None
+    if deleted_only:
+        try:
+            src = connect(db_path)
+            try:
+                ST = session_table(src)
+                live_ids = {r[0] for r in src.execute(f"SELECT id FROM {ST}")}
+            finally:
+                src.close()
+        except Exception:
+            live_ids = None
     try:
         lcon = ledger_connect(db_path)
     except Exception:
         return out
     try:
         for r in lcon.execute(
-            """SELECT time_created, tokens_input, tokens_output, tokens_reasoning,
-                      tokens_cache_read, tokens_cache_write, cost, msgs
+            """SELECT session_id, deleted, time_created, tokens_input, tokens_output,
+                      tokens_reasoning, tokens_cache_read, tokens_cache_write, cost, msgs
                FROM session_usage"""
         ):
+            if deleted_only:
+                missing_from_source = (
+                    live_ids is not None and r["session_id"] not in live_ids
+                )
+                if not (r["deleted"] or missing_from_source):
+                    continue
             ms = r["time_created"] or 0
             day = _day(ms)
             if not day:
@@ -1074,13 +1304,16 @@ def ledger_day_tokens(db_path):
             cost = r["cost"] or 0
             e = out.setdefault(
                 day,
-                {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0, "cost": 0.0,
+                {"ti": 0.0, "to": 0.0, "tr": 0.0, "cache": 0.0,
+                 "cache_read": 0.0, "cache_write": 0.0, "cost": 0.0,
                  "sessions": 0, "msgs": 0},
             )
             e["ti"] += ti
             e["to"] += to
             e["tr"] += tr
             e["cache"] += cache
+            e["cache_read"] += cr
+            e["cache_write"] += cw
             e["cost"] += cost
             e["sessions"] += 1
             e["msgs"] += r["msgs"] or 0
@@ -1108,14 +1341,14 @@ def ledger_rollups(db_path, ldays):
     except Exception:
         return None
     try:
-        models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0})
+        models = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cr": 0, "cost": 0})
         for r in lcon.execute(
             """SELECT model, COUNT(*) AS n,
                       COALESCE(SUM(tokens_input),0) AS ti,
                       COALESCE(SUM(tokens_output),0) AS to_,
                       COALESCE(SUM(tokens_reasoning),0) AS tr,
-                      COALESCE(SUM(tokens_cache_read),0)
-                        +COALESCE(SUM(tokens_cache_write),0) AS ca,
+                      COALESCE(SUM(tokens_cache_read),0) AS cr,
+                      COALESCE(SUM(tokens_cache_write),0) AS cw,
                       COALESCE(SUM(cost),0) AS cost
                FROM session_usage GROUP BY model"""
         ):
@@ -1124,7 +1357,8 @@ def ledger_rollups(db_path, ldays):
             m["ti"] += r["ti"]
             m["to"] += r["to_"]
             m["tr"] += r["tr"]
-            m["cache"] += r["ca"]
+            m["cache"] += (r["cr"] or 0) + (r["cw"] or 0)
+            m["cr"] += r["cr"] or 0
             m["cost"] += r["cost"]
         model_rows = []
         for k, v in models.items():
@@ -1132,7 +1366,7 @@ def ledger_rollups(db_path, ldays):
             model_rows.append(
                 [k, v["n"], tot, v["ti"], v["to"], v["tr"], v["cache"], v["cost"],
                  round(tot / v["n"], 0) if v["n"] else 0,
-                 cache_rate(v["ti"], v["cache"])]
+                 cache_rate(v["ti"], v["cr"])]
             )
         model_rows.sort(key=lambda kv: -kv[2])
 
@@ -1216,9 +1450,11 @@ def ledger_rollups(db_path, ldays):
             slot["to"] = ld["to"]
             slot["tr"] = ld["tr"]
             slot["cache"] = ld["cache"]
+            slot["cache_read"] = ld.get("cache_read", 0)
+            slot["cache_write"] = ld.get("cache_write", 0)
             slot["msgs"] = ld.get("msgs", 0)
             slot["sessions"] = ld.get("sessions", 0)
-        records["streaks"] = compute_streaks(activity, tokens_only=True)
+        records["streaks"] = compute_streaks(activity)
 
         if ldays:
             dates = sorted(ldays)
@@ -1256,75 +1492,98 @@ def merge_ledger_into_stats(stats, db_path):
     stats["totals"]["cost"] = agg["cost"]
     total_tokens = agg["ti"] + agg["to"] + agg["tr"] + agg["cr"] + agg["cw"]
     stats["totals"]["tokens_total"] = total_tokens
+    stats["totals"]["tokens_cache_total"] = agg["cr"] + agg["cw"]
     stats["totals"]["cache_rate"] = cache_rate(agg["ti"], agg["cr"])
     stats["totals"]["avg_tokens_per_session"] = (
         round(total_tokens / agg["sessions"], 0) if agg["sessions"] else 0
     )
 
-    ldays = ledger_day_tokens(db_path)
-    existing_dates = {e["date"] for e in stats["days"]}
+    # Live days are already reconciled against live session totals.  Only add
+    # the delta for sessions that have disappeared; never replace live day
+    # values with ledger session-start attribution (that would move a session
+    # that ran past midnight onto its start date).
+    deleted_days = ledger_day_tokens(db_path, deleted_only=True)
+    live_by_date = {e["date"]: e for e in stats["days"]}
+    for date, ld in deleted_days.items():
+        e = live_by_date.get(date)
+        if e is None:
+            e = {
+                "date": date,
+                "msgs": 0,
+                "sessions": 0,
+                "ti": 0.0,
+                "to": 0.0,
+                "tr": 0.0,
+                "cache": 0.0,
+                "cache_read": 0.0,
+                "cache_write": 0.0,
+                "cost": 0.0,
+            }
+            stats["days"].append(e)
+            live_by_date[date] = e
+        e["ti"] = round((e.get("ti") or 0) + ld["ti"], 4)
+        e["to"] = round((e.get("to") or 0) + ld["to"], 4)
+        e["tr"] = round((e.get("tr") or 0) + ld["tr"], 4)
+        e["cache"] = round((e.get("cache") or 0) + ld["cache"], 4)
+        e["cache_read"] = round((e.get("cache_read") or 0) + ld.get("cache_read", 0), 4)
+        e["cache_write"] = round((e.get("cache_write") or 0) + ld.get("cache_write", 0), 4)
+        e["cost"] = round((e.get("cost") or 0) + ld["cost"], 4)
+        e["sessions"] = (e.get("sessions") or 0) + ld["sessions"]
+        e["msgs"] = (e.get("msgs") or 0) + ld["msgs"]
     for e in stats["days"]:
-        ld = ldays.get(e["date"])
-        if ld:
-            e["ti"] = round(ld["ti"], 4)
-            e["to"] = round(ld["to"], 4)
-            e["tr"] = round(ld["tr"], 4)
-            e["cache"] = round(ld["cache"], 4)
-            e["cost"] = round(ld["cost"], 4)
-            # Ledger session/message counts keep the daily table historical
-            # even after the live rows behind them are deleted.
-            e["msgs"] = ld["msgs"]
-            e["sessions"] = ld["sessions"]
-        else:
-            e["ti"] = 0
-            e["to"] = 0
-            e["tr"] = 0
-            e["cache"] = 0
-            e["cost"] = 0
-        e["total"] = round(e["ti"] + e["to"] + e["tr"] + e["cache"], 1)
-    for date, ld in ldays.items():
-        if date not in existing_dates:
-            stats["days"].append(
-                {
-                    "date": date,
-                    "msgs": ld["msgs"],
-                    "sessions": ld["sessions"],
-                    "ti": round(ld["ti"], 4),
-                    "to": round(ld["to"], 4),
-                    "tr": round(ld["tr"], 4),
-                    "cache": round(ld["cache"], 4),
-                    "cost": round(ld["cost"], 4),
-                    "total": round(ld["ti"] + ld["to"] + ld["tr"] + ld["cache"], 1),
-                }
-            )
+        e["total"] = round(
+            (e.get("ti") or 0) + (e.get("to") or 0) + (e.get("tr") or 0)
+            + (e.get("cache") or 0),
+            1,
+        )
     stats["days"] = sorted(stats["days"], key=lambda x: x["date"])
 
+    # Activity keeps its existing live values; only deleted deltas are added.
     for slot in stats.get("activity", []):
-        ld = ldays.get(slot["date"])
-        if ld:
-            slot["ti"] = round(ld["ti"], 4)
-            slot["to"] = round(ld["to"], 4)
-            slot["tr"] = round(ld["tr"], 4)
-            slot["cache"] = round(ld["cache"], 4)
-            slot["cost"] = round(ld["cost"], 4)
-            slot["msgs"] = ld["msgs"]
-            slot["sessions"] = ld["sessions"]
-        else:
-            slot["ti"] = 0
-            slot["to"] = 0
-            slot["tr"] = 0
-            slot["cache"] = 0
-            slot["cost"] = 0.0
+        ld = deleted_days.get(slot["date"])
+        if not ld:
+            continue
+        slot["ti"] = round((slot.get("ti") or 0) + ld["ti"], 4)
+        slot["to"] = round((slot.get("to") or 0) + ld["to"], 4)
+        slot["tr"] = round((slot.get("tr") or 0) + ld["tr"], 4)
+        slot["cache"] = round((slot.get("cache") or 0) + ld["cache"], 4)
+        slot["cache_read"] = round((slot.get("cache_read") or 0) + ld.get("cache_read", 0), 4)
+        slot["cache_write"] = round((slot.get("cache_write") or 0) + ld.get("cache_write", 0), 4)
+        slot["cost"] = round((slot.get("cost") or 0) + ld["cost"], 4)
+        slot["sessions"] = (slot.get("sessions") or 0) + ld["sessions"]
+        slot["msgs"] = (slot.get("msgs") or 0) + ld["msgs"]
+        slot["total"] = round(
+            (slot.get("ti") or 0) + (slot.get("to") or 0) + (slot.get("tr") or 0)
+            + (slot.get("cache") or 0),
+            1,
+        )
 
     # Historical rollups: models/agents/projects/records/range are rebuilt
-    # from the ledger so a fully-deleted chat history still reports them.
-    rollups = ledger_rollups(db_path, ldays)
+    # from the full ledger, while biggest_day/streaks use the merged days.
+    merged_days = {e["date"]: e for e in stats["days"]}
+    rollups = ledger_rollups(db_path, merged_days)
     if rollups:
         stats["models"] = rollups["models"]
         stats["agents"] = rollups["agents"]
         stats["projects"] = rollups["projects"]
         stats["records"] = rollups["records"]
         stats["range"] = rollups["range"]
+    else:
+        if stats["days"]:
+            biggest = max(stats["days"], key=lambda d: d["total"])
+            stats["records"]["biggest_day"] = {
+                "date": biggest["date"],
+                "total": biggest["total"],
+                "sessions": biggest.get("sessions", 0),
+            }
+            stats["range"] = f"{stats['days'][0]['date']} → {stats['days'][-1]['date']}"
+
+    # Keep the daily identity even if the ledger retains undated sessions:
+    # any token not attributable to a date is reported as unattributed.
+    day_sum = sum(e.get("total", 0) for e in stats["days"])
+    residual = total_tokens - day_sum
+    stats["totals"]["unattributed"] = round(residual, 1) if residual > 0.5 else 0
+
     if stats.get("insights"):
         stats["insights"][0] = (
             f"Across {agg['sessions']} sessions you used {total_tokens:,.0f} tokens "
@@ -1362,14 +1621,13 @@ def recovered_tokens_for(db_path):
 
 
 def apply_recovered_adjustment(stats, amount):
-    """Attribute recovered OpenCode tokens to an `Other` model row.
+    """Attach recovered OpenCode history as lifetime-only metadata.
 
-    The amount is distributed across input / output / reasoning / cache-read /
-    cache-write in the same ratio as the live totals, so the recovered history
-    keeps the user's real token mix. Only `totals`, `models` and the
-    `recovered` metadata change: days, activity, records, range, agents and
-    projects are intentionally untouched, so daily charts and records never
-    show the historical recovery as fresh activity.
+    The amount is distributed across input / output / reasoning / cache in the
+    same ratio as the recorded totals, so the recovered history keeps the
+    user's real token mix.  It is deliberately *not* folded into `totals` or
+    `models`: recorded totals, daily charts and rankings stay exact.  A
+    separate `lifetime` rollup (recorded + recovered) is exposed for display.
     """
     if not isinstance(stats, dict):
         return stats
@@ -1405,38 +1663,15 @@ def apply_recovered_adjustment(stats, amount):
         else:
             parts["input"] += diff
     cache_total = parts["cache_read"] + parts["cache_write"]
-    totals["tokens_input"] = num(totals.get("tokens_input")) + parts["input"]
-    totals["tokens_output"] = num(totals.get("tokens_output")) + parts["output"]
-    totals["tokens_reasoning"] = num(totals.get("tokens_reasoning")) + parts["reasoning"]
-    totals["tokens_cache_read"] = num(totals.get("tokens_cache_read")) + parts["cache_read"]
-    totals["tokens_cache_write"] = num(totals.get("tokens_cache_write")) + parts["cache_write"]
-    total_tokens = (totals["tokens_input"] + totals["tokens_output"]
-                    + totals["tokens_reasoning"] + totals["tokens_cache_read"]
-                    + totals["tokens_cache_write"])
-    totals["tokens_total"] = total_tokens
-    totals["cache_rate"] = cache_rate(totals["tokens_input"], totals["tokens_cache_read"])
-    sessions = num(totals.get("sessions"))
-    totals["avg_tokens_per_session"] = round(total_tokens / sessions, 0) if sessions else 0
 
-    models = stats.get("models")
-    if not isinstance(models, list):
-        models = []
-        stats["models"] = models
-    for row in models:
-        if isinstance(row, list) and len(row) >= 10 and str(row[0]) == "Other":
-            row[2] = num(row[2]) + amount
-            row[3] = num(row[3]) + parts["input"]
-            row[4] = num(row[4]) + parts["output"]
-            row[5] = num(row[5]) + parts["reasoning"]
-            row[6] = num(row[6]) + cache_total
-            row[9] = cache_rate(row[3], row[6])
-            break
-    else:
-        models.append(
-            ["Other", 0, amount, parts["input"], parts["output"], parts["reasoning"],
-             cache_total, 0, 0, cache_rate(parts["input"], cache_total)]
+    recorded_total = num(totals.get("tokens_total"))
+    if not recorded_total:
+        recorded_total = sum(value for _key, value in buckets)
+    recorded_cache = num(totals.get("tokens_cache_total"))
+    if not recorded_cache:
+        recorded_cache = num(totals.get("tokens_cache_read")) + num(
+            totals.get("tokens_cache_write")
         )
-    models.sort(key=lambda r: -num(r[2]) if isinstance(r, (list, tuple)) and len(r) > 2 else 0)
 
     stats["recovered"] = {
         "tokens_total": amount,
@@ -1444,8 +1679,27 @@ def apply_recovered_adjustment(stats, amount):
         "tokens_output": parts["output"],
         "tokens_reasoning": parts["reasoning"],
         "tokens_cache": cache_total,
-        "model": "Other",
+        "included_in_totals": False,
     }
+    stats["lifetime"] = {
+        "tokens_total": recorded_total + amount,
+        "tokens_input": num(totals.get("tokens_input")) + parts["input"],
+        "tokens_output": num(totals.get("tokens_output")) + parts["output"],
+        "tokens_reasoning": num(totals.get("tokens_reasoning")) + parts["reasoning"],
+        "tokens_cache": recorded_cache + cache_total,
+        "cost": num(totals.get("cost")),
+        "recorded_total": recorded_total,
+        "recovered_total": amount,
+    }
+
+    insights = stats.get("insights")
+    if isinstance(insights, list):
+        note = (
+            f"Recovered history: {amount:,.0f} tokens from deleted sessions — "
+            f"lifetime metadata only, excluded from recorded totals and daily charts."
+        )
+        if note not in insights:
+            insights.insert(1 if insights else 0, note)
     return stats
 
 
@@ -1467,14 +1721,15 @@ def cached_local_stats(db_path):
             return LOCAL_CACHE["stats"]
     con = connect(db_path)
     try:
-        sync_session_ledger(db_path, con)
+        synced = sync_session_ledger(db_path, con)
         stats = query_stats(con)
     finally:
         con.close()
-    try:
-        stats = merge_ledger_into_stats(stats, db_path)
-    except Exception:
-        pass
+    if synced:
+        try:
+            stats = merge_ledger_into_stats(stats, db_path)
+        except Exception:
+            pass
     try:
         amount = recovered_tokens_for(db_path)
         if amount:
@@ -2427,6 +2682,7 @@ PAGE = r"""<!DOCTYPE html>
   --shadow:0 1px 2px rgba(28,28,26,.05),0 8px 24px rgba(28,28,26,.06);
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --topbar-h:59px;
 }
 [data-theme="dark"]{
   --bg:#0c0d10; --panel:#131418; --panel2:#17181d; --line:#24252c; --line2:#1e1f25;
@@ -2439,22 +2695,94 @@ PAGE = r"""<!DOCTYPE html>
 html{scroll-behavior:smooth}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;
   transition:background .25s ease,color .25s ease}
-.wrap{max-width:1080px;margin:0 auto;padding:0 28px 70px}
+/* app shell */
+.app{display:flex;align-items:flex-start;min-height:100vh}
+.main{flex:1;min-width:0;display:flex;flex-direction:column;min-height:100vh}
+.wrap{width:100%;max-width:1240px;margin:0 auto;padding:0 28px 70px}
 .mono{font-family:var(--mono)}
+.skip{position:fixed;left:12px;top:-64px;z-index:300;background:var(--panel);border:1px solid var(--accent);
+  color:var(--text);border-radius:9px;padding:9px 14px;font-weight:700;text-decoration:none;box-shadow:var(--shadow);
+  transition:top .15s ease}
+.skip:focus{top:12px}
+
+/* rail */
+.rail{position:sticky;top:0;z-index:45;width:232px;flex:0 0 232px;height:100vh;display:flex;flex-direction:column;
+  gap:10px;padding:18px 14px 14px;background:var(--panel2);border-right:1px solid var(--line);overflow:hidden}
+.rail-brand{display:flex;align-items:center;gap:10px;padding:6px 8px 14px;color:var(--text);text-decoration:none;
+  border-radius:10px;min-width:0}
+.rail-brand:hover{background:var(--chip)}
+.rail-brand:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rail-logo{width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:flex;align-items:center;justify-content:center;gap:2px;box-shadow:var(--shadow)}
+.rail-logo i{display:block;width:3px;border-radius:2px;background:#fff;opacity:.92}
+.rail-logo i:nth-child(1){height:9px}.rail-logo i:nth-child(2){height:15px}.rail-logo i:nth-child(3){height:12px}
+.rail-brand-txt{display:flex;flex-direction:column;line-height:1.15;min-width:0}
+.rail-brand-txt b{font-size:14.5px;font-weight:800;letter-spacing:-.02em;white-space:nowrap}
+.rail-brand-txt small{font-size:10.5px;color:var(--subtle);font-weight:600;letter-spacing:.03em;white-space:nowrap}
+.rail-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+.rail-nav{display:flex;flex-direction:column;gap:2px}
+.rail-kicker{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--subtle);padding:12px 10px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-item{appearance:none;width:100%;display:flex;align-items:center;gap:10px;background:transparent;border:1px solid transparent;
+  color:var(--muted);border-radius:9px;padding:8px 10px;font-family:var(--sans);font-size:13px;font-weight:600;
+  cursor:pointer;text-align:left;transition:background .12s,color .12s,border-color .12s;min-width:0}
+.rail-item:hover{background:var(--chip);color:var(--text)}
+.rail-item.active{background:color-mix(in srgb,var(--accent) 10%,transparent);border-color:color-mix(in srgb,var(--accent) 26%,transparent);
+  color:var(--accent)}
+.rail-item:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.ri-ico{width:22px;flex:0 0 22px;display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-size:10.5px;font-weight:800;letter-spacing:-.04em}
+.view-link .ri-ico{font-size:13px;font-weight:700}
+.ri-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ri-cnt{font-family:var(--mono);font-size:9.5px;font-weight:600;color:var(--subtle);white-space:nowrap;max-width:78px;
+  overflow:hidden;text-overflow:ellipsis}
+.rail-item.active .ri-cnt{color:var(--accent)}
+.rail-div{height:1px;background:var(--line);margin:10px 8px}
+.rail-foot{display:flex;flex-direction:column;gap:2px;border-top:1px solid var(--line);padding-top:10px;flex:0 0 auto}
+.rail-item kbd{font-family:var(--mono);font-size:9.5px;color:var(--subtle);border:1px solid var(--line);border-radius:5px;
+  padding:1px 4px;background:var(--bg);white-space:nowrap}
 
 /* top bar */
 .topbar{position:sticky;top:0;z-index:40;background:var(--bg);border-bottom:1px solid var(--line)}
-.topbar-in{max-width:1080px;margin:0 auto;padding:12px 28px;display:flex;align-items:center;gap:14px}
-.brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:15px;letter-spacing:-.02em}
-.brand .dot{width:9px;height:9px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-.brand small{color:var(--subtle);font-weight:600}
+.topbar-in{max-width:1240px;margin:0 auto;padding:12px 28px;display:flex;align-items:center;gap:12px;flex-wrap:nowrap;min-width:0}
+.crumbs{display:flex;align-items:center;gap:8px;min-width:0;font-size:13px;font-weight:700;letter-spacing:-.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.crumbs .crumb-h{color:var(--text)}
+.crumbs .crumb-sep{color:var(--subtle);font-family:var(--mono);font-weight:500}
+.crumbs .crumb-v{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
 .spacer{flex:1}
 .tbtn{appearance:none;background:var(--chip);border:1px solid var(--line);color:var(--muted);border-radius:9px;
-  height:34px;padding:0 12px;font-family:var(--sans);font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s}
+  height:34px;padding:0 12px;font-family:var(--sans);font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;
+  display:inline-flex;align-items:center;gap:7px;white-space:nowrap;flex:0 0 auto}
 .tbtn:hover{color:var(--text);border-color:var(--subtle)}
 .tbtn:active{transform:scale(.97)}
 .tbtn:disabled{opacity:.5;cursor:wait}
-#status{font-family:var(--mono);font-size:11px;color:var(--subtle);white-space:nowrap}
+.tbtn[aria-expanded="true"]{border-color:var(--accent);color:var(--text)}
+.tico{font-size:13px;line-height:1}
+#status{font-family:var(--mono);font-size:11px;color:var(--subtle);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* mobile navigation strips */
+.mobile-nav{display:none}
+.subnav,.source-tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:none;-ms-overflow-style:none;max-width:100%;min-width:0}
+.subnav::-webkit-scrollbar,.source-tabs::-webkit-scrollbar{display:none}
+.subnav{padding:9px 16px 0}
+.subnav-btn{appearance:none;flex:0 0 auto;background:var(--panel);border:1px solid var(--line);color:var(--muted);
+  border-radius:999px;padding:6px 13px;font-family:var(--sans);font-size:12px;font-weight:600;cursor:pointer;
+  white-space:nowrap;transition:.15s}
+.subnav-btn:hover{color:var(--text);border-color:var(--subtle)}
+.subnav-btn.active{background:color-mix(in srgb,var(--accent) 12%,transparent);border-color:var(--accent);color:var(--accent)}
+.harness-bar{display:none;border-bottom:1px solid var(--line);background:var(--bg)}
+.source-tabs{max-width:1240px;margin:0 auto;padding:9px 28px 0}
+.stab{white-space:nowrap;flex:0 0 auto}
+.stab .cnt{white-space:nowrap;display:inline-block}
+
+/* sub-views */
+.subview{display:none}
+.subview.active{display:block}
+[hidden]{display:none!important}
+.subview:not([data-sub="overview"])>.sec:first-child{margin-top:28px}
+.subview>.hero:first-child+.kpis{margin-top:22px}
 
 /* hero */
 .hero{padding:52px 0 14px}
@@ -2464,6 +2792,18 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .hero .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
 .pill{font-family:var(--mono);font-size:11px;background:var(--panel);border:1px solid var(--line);color:var(--muted);
   padding:5px 12px;border-radius:999px}
+.hero-note{font-family:var(--mono);font-size:11.5px;color:var(--subtle);margin-top:10px;line-height:1.6}
+.hero-note b{color:var(--text);font-weight:700}
+.recovered-note{font-size:12px;color:var(--muted);line-height:1.6;background:var(--panel);border:1px dashed var(--line);
+  border-radius:12px;padding:12px 15px;margin-top:12px}
+.recovered-note b{color:var(--text)}
+.focus-note{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 18px;
+  border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--accent) 7%,var(--bg));
+  font-size:12.5px;color:var(--muted)}
+.focus-note[hidden]{display:none}
+.focus-note button{appearance:none;background:transparent;border:1px solid var(--line);border-radius:7px;
+  color:var(--muted);font-size:12px;line-height:1;padding:5px 8px;cursor:pointer}
+.focus-note button:hover{background:var(--chip);color:var(--text)}
 
 /* KPI strip */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px;margin-top:26px}
@@ -2480,7 +2820,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .krow .dim{color:var(--subtle);font-size:11px;margin-left:5px}
 
 /* sections */
-h2.sec{font-size:17px;font-weight:700;letter-spacing:-.02em;margin:34px 0 14px;display:flex;align-items:baseline;gap:10px;scroll-margin-top:70px}
+h2.sec{font-size:17px;font-weight:700;letter-spacing:-.02em;margin:34px 0 14px;display:flex;align-items:baseline;gap:10px;
+  scroll-margin-top:calc(var(--topbar-h) + 14px)}
 h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-weight:500}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:var(--shadow)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -2529,6 +2870,7 @@ h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-wei
 .search{flex:1;min-width:200px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 13px;
   font-family:var(--sans);font-size:13px;color:var(--text);outline:none}
 .search:focus{border-color:var(--accent)}
+.search:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-color:var(--accent)}
 .search::placeholder{color:var(--subtle)}
 .filter{appearance:none;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:8px 12px;
   font-family:var(--sans);font-size:12.5px;color:var(--muted);cursor:pointer;outline:none}
@@ -2625,7 +2967,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .tbl tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 #search{outline:none}
-#search:focus-visible{border-color:var(--accent)}
+#search:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-color:var(--accent)}
 @media (prefers-reduced-motion: reduce){
   *{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
@@ -2651,12 +2993,47 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .modal-x{float:right;background:var(--chip);border:1px solid var(--line);color:var(--muted);border-radius:8px;
   width:30px;height:30px;cursor:pointer;font-size:14px}
 .modal-x:hover{color:var(--text)}
-.tabs{display:flex;gap:8px;margin:18px 0 -34px;position:relative;z-index:2}
-.wrap.has-tabs .hero{padding-top:18px}
-.tab{appearance:none;background:var(--panel);border:1px solid var(--line);border-bottom:none;border-radius:10px 10px 0 0;
-  padding:9px 18px;font-family:var(--sans);font-size:12.5px;font-weight:700;color:var(--muted);cursor:pointer;transition:.15s}
-.tab:hover{color:var(--text)}
-.tab.active{color:var(--text);border-color:var(--accent);box-shadow:0 -2px 0 var(--accent) inset;background:var(--panel2)}
+
+/* command palette (top-centred dialog, outside every view) */
+.palette-overlay{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.42);backdrop-filter:blur(4px);
+  display:flex;align-items:flex-start;justify-content:center;padding:11vh 16px 18px}
+.palette{width:min(640px,100%);max-height:min(72vh,600px);display:flex;flex-direction:column;background:var(--panel);
+  border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;animation:up .16s ease}
+.palette-search{display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--line)}
+.palette-search span{font-size:15px;color:var(--subtle)}
+.palette-search input{flex:1;min-width:0;border:none;outline:none;background:transparent;color:var(--text);
+  font-family:var(--sans);font-size:15px}
+.palette-search input::placeholder{color:var(--subtle)}
+.palette-search input:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+.palette-list{overflow-y:auto;padding:8px;flex:1;min-height:0}
+.pal-group{margin-bottom:4px}
+.pal-group-label{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--subtle);padding:9px 12px 5px}
+.pal-item{appearance:none;display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:transparent;
+  border:1px solid transparent;border-radius:9px;padding:9px 12px;color:var(--text);font-family:var(--sans);
+  font-size:13px;cursor:pointer;min-width:0}
+.pal-item:hover,.pal-item.active{background:color-mix(in srgb,var(--accent) 10%,transparent);
+  border-color:color-mix(in srgb,var(--accent) 26%,transparent)}
+.pal-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.pal-label{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pal-hint{font-size:11px;color:var(--subtle);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pal-key{font-family:var(--mono);font-size:9.5px;color:var(--subtle);border:1px solid var(--line);border-radius:5px;
+  padding:2px 5px;white-space:nowrap;flex:0 0 auto}
+.pal-empty{padding:26px;text-align:center;color:var(--subtle);font-size:13px}
+.palette-foot{border-top:1px solid var(--line);padding:9px 16px;display:flex;gap:16px;align-items:center;
+  font-family:var(--mono);font-size:10px;color:var(--subtle);white-space:nowrap;overflow:hidden}
+.palette-foot b{color:var(--muted);font-weight:700}
+.palette-close{appearance:none;background:var(--chip);border:1px solid var(--line);color:var(--muted);border-radius:7px;
+  width:26px;height:26px;cursor:pointer;font-size:12px;flex:0 0 auto}
+.palette-close:hover{color:var(--text)}
+.help-modal{max-width:560px}
+.help-modal h2{font-size:18px;letter-spacing:-.02em;margin-bottom:6px}
+.help-modal p{color:var(--muted);font-size:12.5px;margin-bottom:14px}
+.shortcuts{display:grid;gap:8px;margin-top:6px}
+.shortcut{display:flex;align-items:center;justify-content:space-between;gap:18px;border-bottom:1px solid var(--line2);
+  padding:8px 0;font-size:12.5px;color:var(--muted)}
+.shortcut kbd{font-family:var(--mono);font-size:10.5px;color:var(--text);background:var(--chip);border:1px solid var(--line);
+  border-radius:6px;padding:2px 7px;white-space:nowrap}
 .banner{background:color-mix(in srgb,var(--bad) 10%,transparent);border:1px solid color-mix(in srgb,var(--bad) 35%,transparent);
   color:var(--bad);border-radius:10px;padding:10px 14px;margin-top:18px;font-size:12.5px;display:flex;gap:10px;align-items:center}
 .banner b{font-weight:700}
@@ -2673,7 +3050,6 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .segbtn{appearance:none;border:none;background:transparent;padding:8px 14px;font-family:var(--sans);font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer}
 .segbtn.active{background:var(--accent);color:#fff}
 .sbtns{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-#set-status{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .prompt{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;
   padding:11px 14px;margin-bottom:10px;font-size:13px;color:var(--muted);line-height:1.55;white-space:pre-wrap;word-break:break-word}
 .mmeta{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0 4px}
@@ -2681,8 +3057,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px;border:2px solid var(--bg)}
 ::-webkit-scrollbar-thumb:hover{background:var(--subtle)}
-/* source tabs: OpenCode | Codex */
-.source-tabs{display:flex;gap:8px;margin:22px 0 0;position:relative;z-index:2}
+/* source tab pills: only used by the narrow (<=860px) harness bar */
 .stab{appearance:none;background:var(--panel);border:1px solid var(--line);border-radius:10px 10px 0 0;
   padding:9px 20px;font-family:var(--sans);font-size:13px;font-weight:700;color:var(--muted);cursor:pointer;transition:.15s}
 .stab:hover{color:var(--text)}
@@ -2727,9 +3102,6 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .more-btn{display:block;width:100%;margin-top:8px;background:none;border:1px solid var(--line);border-radius:9px;
   padding:7px 10px;font-family:var(--sans);font-size:12px;font-weight:600;color:var(--muted);cursor:pointer}
 .more-btn:hover{color:var(--text);border-color:var(--subtle)}
-.hbar-row{display:flex;align-items:flex-end;gap:3px;height:90px;margin-top:6px}
-.hbar{flex:1;background:linear-gradient(180deg,var(--accent),var(--accent2));border-radius:3px 3px 0 0;min-height:2px;cursor:pointer}
-.hbar:hover{filter:brightness(1.15)}
 .pbtn[aria-pressed="true"]{background:color-mix(in srgb,var(--accent) 14%,transparent);border-color:var(--accent);color:var(--accent)}
 @media(max-width:700px){.model-row{grid-template-columns:1fr;gap:6px}.model-row .mv{text-align:left}}
 /* settings menu */
@@ -2757,44 +3129,144 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .recap-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;margin-top:16px}
 .recap-controls input[type=date]{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:7px 11px;
   font-family:var(--sans);font-size:12.5px;color:var(--text);outline:none}
+/* responsive app shell */
+@media(max-width:1280px){#status{display:none}}
+@media(max-width:1080px){
+  .rail{width:72px;flex-basis:72px;padding:16px 9px 12px}
+  .rail-brand{justify-content:center;padding:4px 0 12px}
+  .rail-brand-txt{display:none}
+  .rail-kicker{display:none}
+  .rail-item{justify-content:center;padding:9px 5px;gap:0}
+  .ri-label,.ri-cnt,.rail-item kbd{display:none}
+  .rail-div{margin:8px 4px}
+  .topbar-in{padding:12px 20px}
+  .source-tabs{padding:9px 20px 0}
+  .wrap{padding:0 20px 60px}
+}
+@media(max-width:860px){
+  html{scrollbar-width:none}
+  html::-webkit-scrollbar{width:0;height:0}
+  .app{display:block}
+  .rail{display:none}
+  .main{min-height:100vh}
+  .harness-bar{display:block}
+  .mobile-nav{display:block;border-bottom:1px solid var(--line);background:var(--bg)}
+  .source-tabs{padding:8px 16px 0;max-width:none}
+  .wrap{padding:0 16px 56px}
+  .topbar-in{padding:10px 16px;gap:10px}
+}
+@media(max-width:640px){
+  .topbar-in{flex-wrap:wrap;padding:8px 12px;gap:8px}
+  .crumbs{flex:1 1 100%;min-width:0;font-size:12.5px}
+  #status,#export-wrap{display:none}
+  .tbtn{padding:0;width:36px;height:36px;justify-content:center}
+  .btn-lbl{display:none}
+  .tico{font-size:15px}
+  .subnav{padding:8px 12px 0}
+  .source-tabs{padding:8px 12px 0}
+  .wrap{padding:0 14px 52px}
+  .hero{padding-top:34px}
+  .palette-overlay{padding:7vh 10px 12px}
+  .palette-foot{gap:10px}
+}
 </style>
 </head>
 <body>
-<div class="topbar">
-  <div class="topbar-in">
-    <div class="brand"><span class="dot"></span>OpenCode<small>· usage</small></div>
-    <div class="spacer"></div>
-    <span id="status"></span>
-    <button class="tbtn" id="theme">◐&nbsp; Light</button>
-    <span class="export-wrap"><button class="tbtn" id="export">⤓ Export</button>
-      <div class="expmenu" id="expmenu">
-        <button data-x="json">JSON <small>full stats payload</small></button>
-        <button data-x="csv">CSV <small>per-day usage table</small></button>
-        <button data-x="recap">Recap CSV <small>all harnesses per day</small></button>
-      </div></span>
-    <span class="export-wrap"><button class="tbtn" id="settings" aria-haspopup="true">⚙ Harnesses</button>
-      <div class="setmenu" id="setmenu" role="menu" aria-label="Harness toggles">
-        <label><input type="checkbox" id="set-opencode" checked> OpenCode</label>
-        <label><input type="checkbox" id="set-router" checked> Codex</label>
-        <label><input type="checkbox" id="set-cline" checked> Cline</label>
-        <div class="shint">Disabled harnesses hide their tab and are excluded from the Recap tab.</div>
-      </div></span>
-    <button class="tbtn" id="refresh">⟳ Refresh</button>
-  </div>
-</div>
-
-<div class="wrap">
-  <div class="source-tabs" role="tablist" aria-label="Data source">
-    <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
-    <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
-    <button class="stab" id="tab-cline" role="tab" aria-selected="false" aria-controls="view-cline">Cline<span class="cnt" id="tab-cline-cnt"></span></button>
-    <button class="stab" id="tab-recap" role="tab" aria-selected="false" aria-controls="view-recap">Recap<span class="cnt" id="tab-recap-cnt"></span></button>
-  </div>
+<a class="skip" href="#main">Skip to content</a>
+<div class="app">
+  <aside class="rail" aria-label="Primary navigation">
+    <a class="rail-brand" id="rail-brand" href="#/opencode/overview" aria-label="OpenCode Dashboard home">
+      <span class="rail-logo" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="rail-brand-txt"><b>OpenCode</b><small>usage</small></span>
+    </a>
+    <div class="rail-scroll">
+      <nav class="rail-nav" aria-label="Harnesses">
+        <div class="rail-kicker">Harnesses</div>
+        <button class="rail-item active" id="rail-tab-opencode" data-harness="opencode" aria-controls="view-opencode" aria-current="page" title="OpenCode" aria-label="OpenCode">
+          <span class="ri-ico" aria-hidden="true">OC</span><span class="ri-label">OpenCode</span><span class="ri-cnt" id="rail-cnt-opencode"></span>
+        </button>
+        <button class="rail-item" id="rail-tab-router" data-harness="router" aria-controls="view-router" title="Codex" aria-label="Codex">
+          <span class="ri-ico" aria-hidden="true">CX</span><span class="ri-label">Codex</span><span class="ri-cnt" id="rail-cnt-router"></span>
+        </button>
+        <button class="rail-item" id="rail-tab-cline" data-harness="cline" aria-controls="view-cline" title="Cline" aria-label="Cline">
+          <span class="ri-ico" aria-hidden="true">CL</span><span class="ri-label">Cline</span><span class="ri-cnt" id="rail-cnt-cline"></span>
+        </button>
+        <button class="rail-item" id="rail-tab-recap" data-harness="recap" aria-controls="view-recap" title="Recap" aria-label="Recap">
+          <span class="ri-ico" aria-hidden="true">RC</span><span class="ri-label">Recap</span><span class="ri-cnt" id="rail-cnt-recap"></span>
+        </button>
+      </nav>
+      <div class="rail-div"></div>
+      <nav class="rail-nav" aria-label="Views">
+        <div class="rail-kicker" id="rail-view-kicker">Views</div>
+        <div id="rail-views"></div>
+      </nav>
+    </div>
+    <div class="rail-foot">
+      <button class="rail-item" id="rail-help" title="Help" aria-label="Help and keyboard shortcuts">
+        <span class="ri-ico" aria-hidden="true">?</span><span class="ri-label">Help</span>
+      </button>
+      <button class="rail-item" id="rail-palette" title="Command palette (⌘K)" aria-label="Open command palette" aria-haspopup="dialog" aria-expanded="false">
+        <span class="ri-ico" aria-hidden="true">⌘</span><span class="ri-label">Command</span><kbd>⌘K</kbd>
+      </button>
+    </div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-in">
+        <div class="crumbs" aria-label="Location"><span class="crumb-h" id="crumb-harness">OpenCode</span><span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-v" id="crumb-view">Overview</span></div>
+        <div class="spacer"></div>
+        <span id="status" role="status" aria-live="polite"></span>
+        <button class="tbtn" id="palette-btn" aria-label="Open command palette" aria-haspopup="dialog" aria-expanded="false" title="Command palette (⌘K)">
+          <span class="tico" aria-hidden="true">⌘</span><span class="btn-lbl">Command</span>
+        </button>
+        <button class="tbtn" id="theme" aria-pressed="false" aria-label="Switch to dark theme" title="Toggle theme">
+          <span class="tico" aria-hidden="true">◐</span><span class="btn-lbl">Light</span>
+        </button>
+        <span class="export-wrap" id="export-wrap"><button class="tbtn" id="export" aria-haspopup="menu" aria-expanded="false" aria-label="Export data" title="Export data">
+          <span class="tico" aria-hidden="true">⤓</span><span class="btn-lbl">Export</span></button>
+          <div class="expmenu" id="expmenu" role="menu" aria-label="Export formats">
+            <button data-x="json" role="menuitem">JSON <small>full stats payload</small></button>
+            <button data-x="csv" role="menuitem">CSV <small>per-day usage table</small></button>
+            <button data-x="recap" role="menuitem">Recap CSV <small>all harnesses per day</small></button>
+          </div></span>
+        <span class="export-wrap"><button class="tbtn" id="settings" aria-haspopup="true" aria-expanded="false" aria-label="Harness settings" title="Harness settings">
+          <span class="tico" aria-hidden="true">⚙</span><span class="btn-lbl">Harnesses</span></button>
+          <div class="setmenu" id="setmenu" role="menu" aria-label="Harness toggles">
+            <label><input type="checkbox" id="set-focus" checked> OpenCode focus mode — hide Codex, Cline and Recap</label>
+            <div class="shint">Focus keeps the rail and palette OpenCode-first. Turn it off to show every harness.</div>
+            <div class="rail-div" style="margin:8px 0"></div>
+            <label><input type="checkbox" id="set-opencode" checked> OpenCode</label>
+            <label><input type="checkbox" id="set-router" checked> Codex</label>
+            <label><input type="checkbox" id="set-cline" checked> Cline</label>
+            <div class="shint">Disabled harnesses hide their tab and are excluded from the Recap tab.</div>
+          </div></span>
+        <button class="tbtn" id="refresh" aria-label="Refresh data" title="Refresh data">
+          <span class="tico" aria-hidden="true">⟳</span><span class="btn-lbl">Refresh</span></button>
+      </div>
+    </div>
+    <div class="focus-note" id="focus-note" hidden>
+      <span>Focus mode is on — this harness is hidden from the rail</span>
+      <button type="button" id="focus-note-x" aria-label="Dismiss focus mode note">✕</button>
+    </div>
+    <div class="mobile-nav">
+      <div class="subnav" id="subnav" role="tablist" aria-label="Views"></div>
+    </div>
+    <div class="harness-bar">
+      <div class="source-tabs" role="tablist" aria-label="Data source">
+        <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode" data-harness="opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
+        <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router" data-harness="router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
+        <button class="stab" id="tab-cline" role="tab" aria-selected="false" aria-controls="view-cline" data-harness="cline">Cline<span class="cnt" id="tab-cline-cnt"></span></button>
+        <button class="stab" id="tab-recap" role="tab" aria-selected="false" aria-controls="view-recap" data-harness="recap">Recap<span class="cnt" id="tab-recap-cnt"></span></button>
+      </div>
+    </div>
+    <main class="wrap" id="main" tabindex="-1">
   <div id="view-opencode" role="tabpanel" aria-labelledby="tab-opencode">
+  <div class="subview active" data-sub="overview">
   <section class="hero">
     <div class="eyebrow" id="range"></div>
     <h1 id="headline"></h1>
     <div class="pills" id="pills"></div>
+    <div class="hero-note" id="hero-note"></div>
     <section class="summary" id="summary" aria-label="Token summary"></section>
     <div class="presets" id="presets" role="group" aria-label="Time range">
       <span class="pl">Period</span>
@@ -2811,9 +3283,6 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 
   <section class="kpis" id="kpis"></section>
 
-  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
-  <section class="records" id="records"></section>
-
   <h2 class="sec">Notes on your usage <span class="hint" id="notes-hint">generated from your local data</span></h2>
   <section class="insights" id="insights"></section>
 
@@ -2823,6 +3292,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div id="tok-chart"></div>
     <div class="legend" id="tok-legend"></div>
   </div>
+  </div><!-- /subview overview -->
+
+  <div class="subview" data-sub="code">
   <div class="grid2" style="margin-top:14px">
     <div class="card chart-card">
       <div class="ctitle">Tokens by file / subsystem <small id="file-sub">equal-split · click to filter</small></div>
@@ -2841,14 +3313,19 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div id="commit-chart" class="crows"></div>
     </div>
   </div>
+  </div><!-- /subview code -->
 
+  <div class="subview" data-sub="models">
   <h2 class="sec" id="sec-env">Tokens by model <span class="hint">universal comparison · click a model to filter</span></h2>
   <div class="card" id="model-card"><div id="models"></div><div class="legend" id="model-legend"></div></div>
+  <div class="recovered-note" id="recovered-note" hidden></div>
   <div class="grid2" style="margin-top:14px">
     <div class="card"><div class="ctitle">Projects <small>token leaderboard</small></div><div class="chips" id="projects"></div></div>
     <div class="card"><div class="ctitle">Agents <small>sessions · tokens</small></div><div class="chips" id="agents"></div></div>
   </div>
+  </div><!-- /subview models -->
 
+  <div class="subview" data-sub="sessions">
   <h2 class="sec" id="sec-sessions">Sessions <span class="hint" id="sess-hint"></span></h2>
   <div class="card">
     <div class="tbl-tools">
@@ -2870,6 +3347,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       </table>
     </div>
   </div>
+  </div><!-- /subview sessions -->
+
+  <div class="subview" data-sub="activity">
+  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
+  <section class="records" id="records"></section>
 
   <h2 class="sec" id="sec-heat">Activity <span class="hint">last 52 weeks · token intensity · click to filter</span></h2>
   <div class="card">
@@ -2877,8 +3359,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-scroll"><div id="act"></div></div>
     <div class="act-legend" id="act-legend"></div>
   </div>
+  </div><!-- /subview activity -->
   </div><!-- /view-opencode -->
   <div id="view-router" role="tabpanel" aria-labelledby="tab-router" hidden>
+  <div class="subview active" data-sub="overview">
   <section class="hero" style="padding-top:26px">
     <div class="eyebrow" id="r-range"></div>
     <h1 id="r-headline"></h1>
@@ -2899,9 +3383,6 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="rbanner" id="r-rate-banner" style="display:none"></div>
   <section class="kpis" id="r-kpis"></section>
 
-  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
-  <section class="records" id="r-records"></section>
-
   <h2 class="sec">Notes on your usage <span class="hint" id="r-notes-hint">generated from your codex data</span></h2>
   <section class="insights" id="r-insights"></section>
 
@@ -2911,32 +3392,18 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div id="r-tok-chart"></div>
     <div class="legend" id="r-tok-legend"></div>
   </div>
-  <div class="grid2" style="margin-top:14px">
-    <div class="card chart-card">
-      <div class="ctitle">Tokens by file / subsystem <small id="r-file-sub">from local edit + write touches</small></div>
-      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Files or subsystems">
-        <button class="pbtn active" data-rfs="file">Files</button>
-        <button class="pbtn" data-rfs="sub">Subsystems</button>
-      </div>
-      <div id="r-file-chart" class="crows"></div>
-    </div>
-    <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="r-commit-sub">prior 24h requests · time-matched</small></div>
-      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
-        <button class="pbtn active" data-rcs="toks">By tokens</button>
-        <button class="pbtn" data-rcs="recent">Recent</button>
-      </div>
-      <div id="r-commit-chart" class="crows"></div>
-    </div>
-  </div>
+  </div><!-- /subview overview -->
 
+  <div class="subview" data-sub="models">
   <h2 class="sec">Tokens by model <span class="hint">universal comparison · click a model to filter</span></h2>
   <div class="card" id="r-model-card"><div id="r-models"></div><div class="legend" id="r-model-legend"></div></div>
   <div class="grid2" style="margin-top:14px">
     <div class="card"><div class="ctitle">Providers <small>request leaderboard</small></div><div class="chips" id="r-providers"></div></div>
     <div class="card"><div class="ctitle">Status <small>ok · errors · click to filter</small></div><div class="chips" id="r-status"></div></div>
   </div>
+  </div><!-- /subview models -->
 
+  <div class="subview" data-sub="requests">
   <h2 class="sec">Requests <span class="hint" id="r-req-hint"></span></h2>
   <div class="card">
     <div class="tbl-tools">
@@ -2958,6 +3425,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       </table>
     </div>
   </div>
+  </div><!-- /subview requests -->
+
+  <div class="subview" data-sub="activity">
+  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
+  <section class="records" id="r-records"></section>
 
   <h2 class="sec">Activity <span class="hint">last 52 weeks · token intensity · click to filter</span></h2>
   <div class="card">
@@ -2965,8 +3437,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-scroll"><div id="r-act"></div></div>
     <div class="act-legend" id="r-act-legend"></div>
   </div>
+  </div><!-- /subview activity -->
   </div><!-- /view-router -->
   <div id="view-cline" role="tabpanel" aria-labelledby="tab-cline" hidden>
+  <div class="subview active" data-sub="overview">
   <section class="hero" style="padding-top:26px">
     <div class="eyebrow" id="c-range"></div>
     <h1 id="c-headline"></h1>
@@ -2985,9 +3459,6 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   </section>
   <section class="kpis" id="c-kpis"></section>
 
-  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
-  <section class="records" id="c-records"></section>
-
   <h2 class="sec">Notes on your usage <span class="hint" id="c-notes-hint">generated from your cline data</span></h2>
   <section class="insights" id="c-insights"></section>
 
@@ -2997,33 +3468,17 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div id="c-tok-chart"></div>
     <div class="legend" id="c-tok-legend"></div>
   </div>
-  <div class="grid2" style="margin-top:14px">
-    <div class="card chart-card">
-      <div class="ctitle">Tokens by file / subsystem <small id="c-file-sub">from local edit + write touches</small></div>
-      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Files or subsystems">
-        <button class="pbtn active" data-cfs="file">Files</button>
-        <button class="pbtn" data-cfs="sub">Subsystems</button>
-      </div>
-      <div id="c-file-chart" class="crows"></div>
-    </div>
-    <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="c-commit-sub">prior 24h messages · time-matched</small></div>
-      <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
-        <button class="pbtn active" data-ccs="toks">By tokens</button>
-        <button class="pbtn" data-ccs="recent">Recent</button>
-      </div>
-      <div id="c-commit-chart" class="crows"></div>
-    </div>
-  </div>
+  </div><!-- /subview overview -->
 
+  <div class="subview" data-sub="models">
   <h2 class="sec">Tokens by model <span class="hint">universal comparison · click a model to filter</span></h2>
   <div class="card" id="c-model-card"><div id="c-models"></div><div class="legend" id="c-model-legend"></div></div>
-  <div class="grid2" style="margin-top:14px">
-    <div class="card"><div class="ctitle">Providers <small>message leaderboard</small></div><div class="chips" id="c-providers"></div></div>
-    <div class="card"><div class="ctitle">Sessions <small>click to filter</small></div><div class="chips" id="c-sessions"></div></div>
-  </div>
+  <div class="card" style="margin-top:14px"><div class="ctitle">Providers <small>message leaderboard</small></div><div class="chips" id="c-providers"></div></div>
+  </div><!-- /subview models -->
 
+  <div class="subview" data-sub="sessions">
   <h2 class="sec">Sessions <span class="hint" id="c-req-hint"></span></h2>
+  <div class="card" style="margin-bottom:14px"><div class="ctitle">Sessions <small>click to filter</small></div><div class="chips" id="c-sessions"></div></div>
   <div class="card">
     <div class="tbl-tools">
       <input class="search" id="c-search" placeholder="Filter by title, model or directory…" aria-label="Filter cline sessions">
@@ -3043,6 +3498,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       </table>
     </div>
   </div>
+  </div><!-- /subview sessions -->
+
+  <div class="subview" data-sub="activity">
+  <h2 class="sec">Records <span class="hint">personal bests · token-only</span></h2>
+  <section class="records" id="c-records"></section>
 
   <h2 class="sec">Activity <span class="hint">last 52 weeks · token intensity · click to filter</span></h2>
   <div class="card">
@@ -3050,8 +3510,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-scroll"><div id="c-act"></div></div>
     <div class="act-legend" id="c-act-legend"></div>
   </div>
+  </div><!-- /subview activity -->
   </div><!-- /view-cline -->
   <div id="view-recap" role="tabpanel" aria-labelledby="tab-recap" hidden>
+  <div class="subview active" data-sub="recap">
   <section class="hero" style="padding-top:26px">
     <div class="eyebrow">RECAP · DAILY TOKENS FOR RECORDING</div>
     <h1>How many tokens did I use?</h1>
@@ -3075,12 +3537,43 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <thead><tr><th>Conversation</th><th>Harness</th><th>Model</th><th class="num">Tokens</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
+  </div><!-- /subview recap -->
   </div><!-- /view-recap -->
-</div>
+    </main>
+  </div><!-- /main -->
+</div><!-- /app -->
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
 <div class="tip" id="tip"></div>
 <div class="toasts" id="toasts"></div>
+<div class="palette-overlay" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-labelledby="palette-title">
+    <div class="palette-search">
+      <span aria-hidden="true">⌘</span>
+      <input id="palette-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search views, actions, sessions…" aria-label="Command palette search" aria-controls="palette-list" aria-autocomplete="list" role="combobox" aria-expanded="true">
+      <button class="palette-close" id="palette-close" aria-label="Close command palette">✕</button>
+    </div>
+    <div class="palette-list" id="palette-list" role="listbox" aria-label="Commands">
+      <div class="pal-empty">Type to search commands.</div>
+    </div>
+    <div class="palette-foot"><span><b>↑↓</b> navigate</span><span><b>↵</b> open</span><span><b>esc</b> close</span><span id="palette-title" style="margin-left:auto">Command palette</span></div>
+  </div>
+</div>
+<div class="overlay" id="help-overlay">
+  <div class="modal help-modal" id="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <button class="modal-x" id="help-close" aria-label="Close help">✕</button>
+    <h2 id="help-title">Keyboard &amp; navigation</h2>
+    <p>Move between harnesses and views without leaving the keyboard.</p>
+    <div class="shortcuts">
+      <div class="shortcut"><span>Open command palette</span><kbd>⌘K / Ctrl K</kbd></div>
+      <div class="shortcut"><span>Move through palette results</span><kbd>↑ ↓</kbd></div>
+      <div class="shortcut"><span>Open the highlighted result</span><kbd>↵</kbd></div>
+      <div class="shortcut"><span>Close palette, help or session details</span><kbd>Esc</kbd></div>
+      <div class="shortcut"><span>Jump to content</span><kbd>Tab</kbd></div>
+    </div>
+    <p style="margin-top:16px;margin-bottom:0">Tip: every view has a deep link — copy the address bar to reopen it later.</p>
+  </div>
+</div>
 
 <script>const S0 = __DATA__; const R0 = __ROUTER__; const C0 = __CLINE__;</script>
 <script>
@@ -3090,6 +3583,7 @@ const BOLD=s=>{const ents=[];const t=s.replace(/&(?:#\d+|[a-z]+);/g,m=>{ents.pus
   return t.replace(/(\d[\d,]*(?:\.\d+)?)/g,'<b>$1</b>').replace(/@@[A-Z]+@@/g,m=>ents[m.charCodeAt(2)-65]);};
 const F=n=>{const s=Math.round(Number(n)||0).toString();return s.replace(/\B(?=(\d{3})+(?!\d))/g,',');};
 const FN=n=>{n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
+const FB=n=>{n=Number(n)||0;return n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
 const DT=t=>{if(!t)return'—';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 const DS=t=>{if(!t)return'';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA');};
 const DUR=m=>{if(m==null)return'—';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
@@ -3109,10 +3603,43 @@ let currentRRows=[];
 let currentCRows=[];
 const RFSTATE={day:null,model:null,provider:null,status:''};
 const CFSTATE={day:null,model:null,provider:null,session:null};
-/* harness toggles (Settings gear) + recap date */
-let HARNESS={opencode:true,router:true,cline:true};
-try{const h=JSON.parse(localStorage.getItem('ocd-harness')||'null');if(h&&typeof h==='object'){HARNESS={opencode:h.opencode!==false,router:h.router!==false,cline:h.cline!==false};}}catch(_){}
+/* harness toggles (Settings gear) + OpenCode focus mode */
+let FOCUS = true;
+try{const f=localStorage.getItem('ocd-focus');if(f==='0')FOCUS=false;else if(f==='1')FOCUS=true;}catch(_){}
+let HARNESS={opencode:true,router:false,cline:false};
+let _savedHarness=null;
+try{_savedHarness=JSON.parse(localStorage.getItem('ocd-harness')||'null');}catch(_){}
+if(_savedHarness&&typeof _savedHarness==='object'){
+  HARNESS={opencode:_savedHarness.opencode!==false,router:_savedHarness.router!==false,cline:_savedHarness.cline!==false};
+}else if(!FOCUS){
+  HARNESS={opencode:true,router:true,cline:true};
+}
+function harnessVisible(t){
+  if(t==='opencode')return true;
+  if(FOCUS)return false;
+  if(t==='recap')return true;
+  return !!HARNESS[t];
+}
 let RECAP_DATE=new Date().toLocaleDateString('en-CA');
+/* navigation model: one VIEWS entry per harness, hash-routable with #/slug/view */
+const VIEWS={
+  opencode:[{id:'overview',label:'Overview',icon:'◫'},{id:'models',label:'Models',icon:'◈'},{id:'code',label:'Code',icon:'</>'},{id:'sessions',label:'Sessions',icon:'▤'},{id:'activity',label:'Activity',icon:'▦'}],
+  router:[{id:'overview',label:'Overview',icon:'◫'},{id:'models',label:'Models',icon:'◈'},{id:'requests',label:'Requests',icon:'⇄'},{id:'activity',label:'Activity',icon:'▦'}],
+  cline:[{id:'overview',label:'Overview',icon:'◫'},{id:'models',label:'Models',icon:'◈'},{id:'sessions',label:'Sessions',icon:'▤'},{id:'activity',label:'Activity',icon:'▦'}],
+  recap:[{id:'recap',label:'Daily recap',icon:'◉'}]
+};
+const HARNESS_NAME={opencode:'OpenCode',router:'Codex',cline:'Cline',recap:'Recap'};
+const TAB_ALIAS={opencode:'opencode',codex:'router',router:'router',cline:'cline',recap:'recap'};
+const RANGE_VALUES=['7','30','90','365','all'];
+const SUBVIEW={opencode:'overview',router:'overview',cline:'overview',recap:'recap'};
+try{
+  const sv=JSON.parse(sessionStorage.getItem('ocd-subview')||'null');
+  if(sv&&typeof sv==='object'){
+    Object.keys(SUBVIEW).forEach(k=>{
+      if(sv[k]&&(VIEWS[k]||[]).some(v=>v.id===sv[k]))SUBVIEW[k]=sv[k];
+    });
+  }
+}catch(_){}
 const WID=sessionStorage.getItem('ocd-wid')||('w'+Math.random().toString(36).slice(2));
 sessionStorage.setItem('ocd-wid',WID);
 const FSTATE={day:null,model:null,agent:null,file:null,sub:null,commit:null};
@@ -3147,10 +3674,21 @@ const THEMES={light:{accent:'#4f46e5',accent2:'#0d9488',accent3:'#9333ea',reason
 let theme=localStorage.getItem('ocd-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
 document.documentElement.dataset.theme=theme;
 const T=()=>THEMES[theme];
-function syncThemeBtn(){$('theme').textContent=theme==='dark'?'☀ Light':'◐ Dark';}
+function syncThemeBtn(){
+  const dark=theme==='dark';
+  const btn=$('theme');
+  if(btn){
+    btn.innerHTML='<span class="tico" aria-hidden="true">'+(dark?'☀':'◐')+'</span><span class="btn-lbl">'+(dark?'Light':'Dark')+'</span>';
+    btn.setAttribute('aria-pressed',dark?'true':'false');
+    btn.setAttribute('aria-label',dark?'Switch to light theme':'Switch to dark theme');
+  }
+}
 syncThemeBtn();
-$('theme').onclick=()=>{theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;
-  localStorage.setItem('ocd-theme',theme);syncThemeBtn();renderAll();renderRouter();renderCline();if(TAB==='recap')renderRecap();};
+function toggleTheme(){
+  theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;
+  localStorage.setItem('ocd-theme',theme);syncThemeBtn();renderAll();renderRouter();renderCline();if(TAB==='recap')renderRecap();
+}
+$('theme').onclick=toggleTheme;
 /* svg */
 const svg=(tag,at,html)=>'<'+tag+Object.entries(at).map(([k,v])=>' '+k+'="'+ESC(v)+'"').join('')+'>'+(html||'')+'</'+tag+'>';
 const dayTotal=d=>(d.ti||0)+(d.to||0)+(d.tr||0)+(d.cache||0);
@@ -3208,7 +3746,8 @@ function stackChart(days){
       }
     });
     cells+=svg('rect',{x:(X(i)-slot/2).toFixed(1),y:p,width:(slot*0.96).toFixed(1),height:(h-2*p).toFixed(1),fill:'transparent',
-      class:'inter'+dayDim(day),'data-tip':dayTip(day),'data-f':'day|'+day.date});
+      class:'inter'+dayDim(day),'data-tip':dayTip(day),'data-f':'day|'+day.date,tabindex:'0',role:'button',
+      'aria-label':day.date+', '+FN(dayTotal(day))+' tokens, filter by day'});
     if(i%step===0)xl+=svg('text',{x:X(i).toFixed(1),y:h-p+17,'text-anchor':'middle',fill:'#9a968c','font-size':10},day.date.slice(5));
   });
   const sub=$('tok-sub');
@@ -3313,8 +3852,8 @@ function periodPrev(){
   return S.days.filter(d=>d.date>=s&&d.date<e);
 }
 function sumDays(list){
-  const t={sessions:0,msgs:0,ti:0,to:0,tr:0,cache:0,total:0};
-  list.forEach(d=>{t.sessions+=d.sessions;t.msgs+=d.msgs;t.ti+=d.ti;t.to+=d.to;t.tr+=d.tr;t.cache+=d.cache;t.total+=dayTotal(d);});
+  const t={sessions:0,msgs:0,ti:0,to:0,tr:0,cache:0,cache_read:0,total:0};
+  list.forEach(d=>{t.sessions+=d.sessions;t.msgs+=d.msgs;t.ti+=d.ti;t.to+=d.to;t.tr+=d.tr;t.cache+=d.cache;t.cache_read+=d.cache_read||0;t.total+=dayTotal(d);});
   return t;
 }
 function deltaPct(cur,prev){if(prev==null)return null;if(prev===0)return cur>0?100:0;return Math.round((cur-prev)/prev*100);}
@@ -3327,17 +3866,29 @@ function renderAll(){
   updateTabCounts();
 }
 function renderHero(){
-  const periodLbl=RANGE==='all'?'ALL TIME':(RANGE/30>=1?RANGE/30+' MO':RANGE+' DAYS');
-  $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const periodLbl=RANGE==='all'?'':(RANGE==='365'?'12 MO':(RANGE/30>=1?Math.round(RANGE/30)+' MO':RANGE+' DAYS'));
+  $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+(periodLbl?' · LAST '+periodLbl:'')+' · REFRESHES AUTOMATICALLY';
   $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
   const ltitle=last?ESC(last.title):'—';
   const nModels=S.models.length;
-  $('pills').innerHTML=[
-    ['Total tokens',FN(S.totals.tokens_total||0)],
+  const pills=[
+    ['Recorded tokens',FN(S.totals.tokens_total||0)],
     ['Models',nModels>1?nModels+' models':ESC(((S.models[0]||['—'])[0]+'').split('/').pop())],
-    ['Latest',ltitle.length>36?ltitle.slice(0,36)+'…':ltitle]]
+    ['Latest',ltitle.length>36?ltitle.slice(0,36)+'…':ltitle]
+  ];
+  if(S.recovered&&S.lifetime)pills.push(['Lifetime',FB(S.lifetime.tokens_total)]);
+  $('pills').innerHTML=pills
     .map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
+  const note=$('hero-note');
+  if(note){
+    if(S.recovered&&S.lifetime){
+      note.innerHTML='Lifetime '+FB(S.lifetime.tokens_total)+' = recorded '+FB(S.totals.tokens_total||0)+
+        ' + recovered '+FB(S.recovered.tokens_total)+' · recovered history is metadata from deleted sessions and is excluded from recorded totals.';
+    }else{
+      note.textContent='';
+    }
+  }
 }
 function periodTotal(n){
   const now=new Date();now.setHours(0,0,0,0);
@@ -3352,19 +3903,26 @@ function renderSummary(){
   const prev7=(()=>{const end=new Date();end.setDate(end.getDate()-7);const st=new Date(end);st.setDate(st.getDate()-7);
     return sumDays(S.days.filter(d=>d.date>=st.toLocaleDateString('en-CA')&&d.date<end.toLocaleDateString('en-CA')));})();
   const cards=[
-    ['Today',t1.total,'','tokens'],
-    ['Last 7 days',t7.total,deltaTag(t7.total,prev7.total),'tokens'],
-    ['Last 30 days',t30.total,'','tokens'],
-    ['All time',S.totals.tokens_total||0,'','tokens'],
+    ['Today',t1.total,'','tokens','tokens'],
+    ['Last 7 days',t7.total,deltaTag(t7.total,prev7.total),'tokens','tokens'],
+    ['Last 30 days',t30.total,'','tokens','tokens'],
+    ['All time',S.totals.tokens_total||0,'','tokens',
+      (S.recovered&&S.lifetime)
+        ? '+'+FB(S.recovered.tokens_total)+' recovered = '+FB(S.lifetime.tokens_total)+' lifetime'
+        : 'recorded'],
   ];
-  el.innerHTML=cards.map(([l,v,tag])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+FN(v)+' '+tag+'</div><div class="ss">tokens</div></div>').join('');
+  el.innerHTML=cards.map(([l,v,tag,unit,sub])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+FN(v)+' '+unit+tag+'</div><div class="ss">'+ESC(sub||unit)+'</div></div>').join('');
 }
 function renderKpis(){
   const t=S.totals,c=T();
   const cur=RANGE==='all'?null:sumDays(periodDays());
   const prev=RANGE==='all'?null:sumDays(periodPrev());
   const pv=prev||{sessions:0,msgs:0,ti:0,to:0,tr:0,cache:0,total:0};
-  const tok=cur?{ti:cur.ti,out:cur.to+cur.tr,tr:cur.tr,ca:cur.cache}:{ti:t.tokens_input,out:t.tokens_output+t.tokens_reasoning,tr:t.tokens_reasoning,ca:t.tokens_cache_read};
+  const tok=cur
+    ?{ti:cur.ti,out:cur.to+cur.tr,tr:cur.tr,ca:cur.cache,cr:cur.cache_read||0}
+    :{ti:t.tokens_input,out:t.tokens_output+t.tokens_reasoning,tr:t.tokens_reasoning,
+      ca:(t.tokens_cache_total||((t.tokens_cache_read||0)+(t.tokens_cache_write||0))),
+      cr:t.tokens_cache_read||0};
   const total=tok.ti+tok.out+tok.ca;
   const pct=v=>total?Math.round(v/total*100):0;
   const row=(lbl,v,color,sub)=>'<div class="krow"><span class="lbl"><i class="dot" style="background:'+color+'"></i>'+lbl+
@@ -3373,7 +3931,8 @@ function renderKpis(){
   const msgs=cur?cur.msgs:t.messages;
   const tokTag=cur?deltaTag(total,pv.total):'';
   const actTag=cur?deltaTag(sessions+msgs,pv.sessions+pv.msgs):'';
-  const hitRate=(()=>{const d=(tok.ti||0)+(tok.ca||0);return d?Math.round(tok.ca/d*100):0;})();
+  // Hit rate is read-only; the cached-token volume is read+write.
+  const hitRate=(()=>{const d=(tok.ti||0)+(tok.cr||0);return d?Math.round(tok.cr/d*100):0;})();
   const tokCard='<div class="kpi"><h3>Tokens '+(SPLIT?'(reasoning split)':'(output merged)')+'</h3><div class="big">'+FN(total)+' <small>total</small>'+tokTag+'</div>'+
     '<div class="tokbar">'+[[tok.ti,c.accent],[tok.out-(SPLIT?tok.tr:0),c.accent2]].concat(SPLIT?[[tok.tr,c.reason]]:[]).concat([[tok.ca,c.cache]]).map(([v,k])=>'<i style="width:'+pct(v)+'%;background:'+k+'"></i>').join('')+'</div>'+
     row('Input',FN(tok.ti),c.accent,pct(tok.ti)+'%')+row('Output incl. reasoning',FN(tok.out),c.accent2,pct(tok.out)+'%')+
@@ -3381,9 +3940,9 @@ function renderKpis(){
     row('Cache',FN(tok.ca),c.cache,pct(tok.ca)+'%')+'</div>';
   const avgSess=sessions?Math.round(total/sessions):0;
   const tpm=msgs?Math.round(total/msgs):0;
-  const effCard='<div class="kpi"><h3>Cache &amp; efficiency</h3><div class="big">'+hitRate+'% <small>cache hit</small></div>'+
-    row('Cached tokens',FN(tok.ca),c.cache)+row('Avg / session',FN(avgSess),c.accent)+row('Tokens / message',FN(tpm),c.accent2)+
-    row('Avg tokens/session (all)',FN(t.avg_tokens_per_session||0),'var(--subtle)')+'</div>';
+  const effCard='<div class="kpi"><h3>Cache &amp; efficiency</h3><div class="big">'+hitRate+'% <small>cache hit (read)</small></div>'+
+    row('Cached tokens (read+write)',FN(tok.ca),c.cache)+row('Avg tokens / session (period)',FN(avgSess),c.accent)+row('Tokens / message',FN(tpm),c.accent2)+
+    row('Avg tokens / session (all)',FN(t.avg_tokens_per_session||0),'var(--subtle)')+'</div>';
   const topSub=((S.subsystems||[])[0])||null;
   const burnCard='<div class="kpi"><h3>Burn &amp; activity</h3><div class="big">'+F(sessions)+' <small>sessions</small>'+actTag+'</div>'+
     row('Messages',F(msgs),c.accent)+row('Top subsystem',topSub?ESC(topSub[0]):'—',c.accent2,'all-time')+
@@ -3439,6 +3998,17 @@ function renderModels(){
       '<div class="mv">'+FN(tot)+'</div></div>';
   }).join('');
   $('model-legend').innerHTML='<span><i style="background:'+t.accent+'"></i>Input</span><span><i style="background:'+t.accent2+'"></i>Output incl. reasoning</span>'+(SPLIT?'<span><i style="background:'+t.reason+'"></i>Reasoning</span>':'')+'<span><i style="background:'+t.cache+'"></i>Cache</span>';
+  const rec=$('recovered-note');
+  if(rec){
+    if(S.recovered&&S.lifetime){
+      rec.hidden=false;
+      rec.innerHTML='<b>Recovered history</b> · '+FB(S.recovered.tokens_total)+
+        ' tokens restored from deleted sessions. This is lifetime metadata only — it is excluded from recorded totals, the model ranking and daily charts. '+
+        'Lifetime total: '+FB(S.lifetime.tokens_total)+'.';
+    }else{
+      rec.hidden=true;rec.innerHTML='';
+    }
+  }
 }
 function renderProjAgents(){
   $('projects').innerHTML='<span style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--subtle);font-weight:700;align-self:center">Projects</span>'+
@@ -3476,8 +4046,8 @@ function renderAct(){
       '<span class="trow"><span>Cache</span><b>'+FN(d.cache)+'</b></span>'+
       '<span class="trow"><span>Sessions</span><b>'+d.sessions+'</b></span>'):'';
     const f=d?' data-date="'+d.date+'" data-tip=\''+tipH+'\' data-f="day|'+d.date+'"':'';
-    return '<button class="act-cell'+(d&&d.date===today?' today':'')+(d&&FSTATE.day&&FSTATE.day!==d.date?' dim':'')+'" '+
-      'style="background:'+bg+'" aria-label="'+(d?d.date+', '+FN(tot)+' tokens':'No activity')+'"'+f+'></button>';
+    return '<button type="button" class="act-cell'+(d&&d.date===today?' today':'')+(d&&FSTATE.day&&FSTATE.day!==d.date?' dim':'')+'" '+
+      'style="background:'+bg+'" tabindex="0" role="button" aria-label="'+(d?d.date+', '+FN(tot)+' tokens, filter by day':'No activity')+'"'+f+'></button>';
   };
   let monthHtml='',i=0;
   while(i<cols.length){const m=cols[i].month;let j=i;while(j<cols.length&&cols[j].month===m)j++;
@@ -3716,7 +4286,7 @@ function renderRouterStatus(pc){
     ['OK',v('ok'),T().accent2,'ok'],
     ['Errors',v('err'),(v('err')?'var(--bad)':'var(--subtle)'),'err'],
     ['429 rate-limited',v('err429'),(v('err429')?'var(--bad)':'var(--subtle)'),'429'],
-    ['5xx upstream',v('err500'),'var(--bad)','err'],
+    ['5xx upstream',v('err500'),(v('err500')?'var(--bad)':'var(--subtle)'),'err500'],
   ];
   $('r-status').innerHTML=items.map(([l,v,cc,k])=>'<span class="chip'+(RFSTATE.status===k?' active':'')+'" data-rs="'+k+'" data-tip="<b>'+l+'</b><span class=\'trow\'><span>Requests</span><b>'+F(v)+'</b></span>">'+
     '<i style="width:9px;height:9px;border-radius:3px;background:'+cc+';display:inline-block"></i>'+l+' · '+F(v)+'</span>').join('');
@@ -3745,8 +4315,8 @@ function renderRouterAct(){
     const tipH=dd?('<b>'+dd.date+'</b><span class="trow"><span>Total tokens</span><b>'+FN(tot)+'</b></span>'+
       '<span class="trow"><span>Requests</span><b>'+F(dd.reqs||dd.msgs||0)+'</b></span>'):'';
     const f=dd?' data-tip=\''+tipH+'\' data-rday="'+dd.date+'"':'';
-    return '<button class="act-cell'+(dd&&dd.date===today?' today':'')+(dd&&RFSTATE.day&&RFSTATE.day!==dd.date?' dim':'')+'" '+
-      'style="background:'+bg+'" aria-label="'+(dd?dd.date+', '+FN(tot)+' tokens':'No activity')+'"'+f+'></button>';
+    return '<button type="button" class="act-cell'+(dd&&dd.date===today?' today':'')+(dd&&RFSTATE.day&&RFSTATE.day!==dd.date?' dim':'')+'" '+
+      'style="background:'+bg+'" tabindex="0" role="button" aria-label="'+(dd?dd.date+', '+FN(tot)+' tokens, filter by day':'No activity')+'"'+f+'></button>';
   };
   let monthHtml='',i=0;
   while(i<cols.length){const m=cols[i].month;let j=i;while(j<cols.length&&cols[j].month===m)j++;
@@ -3784,8 +4354,8 @@ function renderRouterFilterBar(){
 function renderRouter(){
   if(!R)return;
   const t=R.totals||{};
-  const periodLbl=RRANGE==='all'?'ALL TIME':(RRANGE/30>=1?RRANGE/30+' MO':RRANGE+' DAYS');
-  $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const periodLbl=RRANGE==='all'?'':(RRANGE==='365'?'12 MO':(RRANGE/30>=1?Math.round(RRANGE/30)+' MO':RRANGE+' DAYS'));
+  $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+(periodLbl?' · LAST '+periodLbl:'')+' · REFRESHES AUTOMATICALLY';
   const cur=RRANGE==='all'?null:rSumDays(rPeriodDays());
   const totTokens=cur?cur.total:(t.tokens_total||0);
   const totReqs=cur?cur.reqs:(t.requests||0);
@@ -3899,6 +4469,7 @@ function routerRequestRows(){
     }
     if(st==='ok'&&!r.ok)return false;
     if(st==='err'&&r.ok)return false;
+    if(st==='err500'&&!(r.status>=500))return false;
     if(st==='429'&&r.status!==429)return false;
     if(cut){
       const ms=Date.parse(r.at||'');
@@ -3984,7 +4555,8 @@ function cStackChart(days){
       }
     });
     cells+=svg('rect',{x:(X(i)-slot/2).toFixed(1),y:p,width:(slot*0.96).toFixed(1),height:(h-2*p).toFixed(1),fill:'transparent',
-      class:'inter'+(CFSTATE.day&&CFSTATE.day!==day.date?' dim':''),'data-tip':cDayTip(day),'data-cday':day.date});
+      class:'inter'+(CFSTATE.day&&CFSTATE.day!==day.date?' dim':''),'data-tip':cDayTip(day),'data-cday':day.date,
+      tabindex:'0',role:'button','aria-label':day.date+', '+FN(cDayTotal(day))+' tokens, filter by day'});
     if(i%step===0)xl+=svg('text',{x:X(i).toFixed(1),y:h-p+17,'text-anchor':'middle',fill:'#9a968c','font-size':10},day.date.slice(5));
   });
   const sub=$('c-tok-sub');
@@ -4087,8 +4659,8 @@ function renderClineAct(){
     const tipH=dd?('<b>'+dd.date+'</b><span class="trow"><span>Total tokens</span><b>'+FN(tot)+'</b></span>'+
       '<span class="trow"><span>Messages</span><b>'+F(dd.reqs||dd.msgs||0)+'</b></span>'):'';
     const f=dd?' data-tip=\''+tipH+'\' data-cday="'+dd.date+'"':'';
-    return '<button class="act-cell'+(dd&&dd.date===today?' today':'')+(dd&&CFSTATE.day&&CFSTATE.day!==dd.date?' dim':'')+'" '+
-      'style="background:'+bg+'" aria-label="'+(dd?dd.date+', '+FN(tot)+' tokens':'No activity')+'"'+f+'></button>';
+    return '<button type="button" class="act-cell'+(dd&&dd.date===today?' today':'')+(dd&&CFSTATE.day&&CFSTATE.day!==dd.date?' dim':'')+'" '+
+      'style="background:'+bg+'" tabindex="0" role="button" aria-label="'+(dd?dd.date+', '+FN(tot)+' tokens, filter by day':'No activity')+'"'+f+'></button>';
   };
   let monthHtml='',i=0;
   while(i<cols.length){const m=cols[i].month;let j=i;while(j<cols.length&&cols[j].month===m)j++;
@@ -4156,8 +4728,8 @@ function renderClineSessions(){
 function renderCline(){
   if(!C)return;
   const t=C.totals||{};
-  const periodLbl=CRANGE==='all'?'ALL TIME':(CRANGE/30>=1?CRANGE/30+' MO':CRANGE+' DAYS');
-  $('c-range').textContent='CLINE · '+(C.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const periodLbl=CRANGE==='all'?'':(CRANGE==='365'?'12 MO':(CRANGE/30>=1?Math.round(CRANGE/30)+' MO':CRANGE+' DAYS'));
+  $('c-range').textContent='CLINE · '+(C.range||'').toUpperCase()+(periodLbl?' · LAST '+periodLbl:'')+' · REFRESHES AUTOMATICALLY';
   const cur=CRANGE==='all'?null:cSumDays(cPeriodDays());
   const totTokens=cur?cur.total:(t.tokens_total||0);
   const totMsgs=cur?cur.reqs:(t.requests||0);
@@ -4333,44 +4905,186 @@ function recapCopyText(){
   return lines.join('\n');
 }
 /* ---- harness settings ---- */
+/* ---- navigation, hash routing and chrome ---- */
+function firstVisibleTab(){
+  if(FOCUS)return'opencode';
+  if(HARNESS.opencode)return'opencode';
+  if(HARNESS.router)return'router';
+  if(HARNESS.cline)return'cline';
+  return'recap';
+}
+function tabRange(tab){
+  return tab==='router'?RRANGE:tab==='cline'?CRANGE:tab==='opencode'?RANGE:'all';
+}
+function setTabRange(tab,r){
+  if(RANGE_VALUES.indexOf(r)<0)return;
+  if(tab==='router')RRANGE=r;else if(tab==='cline')CRANGE=r;else if(tab==='opencode')RANGE=r;
+}
+function hashForState(){
+  const slug=TAB==='router'?'codex':TAB;
+  let h='#/'+slug;
+  if(TAB!=='recap')h+='/'+(SUBVIEW[TAB]||VIEWS[TAB][0].id);
+  const r=tabRange(TAB);
+  if(TAB!=='recap'&&r&&r!=='all')h+='?range='+encodeURIComponent(r);
+  return h;
+}
+function parseHash(raw){
+  if(!raw||raw.charAt(0)!=='#'||raw.charAt(1)!=='/')return null;
+  let rest=raw.slice(2),qs='';
+  const qi=rest.indexOf('?');
+  if(qi>=0){qs=rest.slice(qi+1);rest=rest.slice(0,qi);}
+  const parts=rest.split('/').filter(Boolean);
+  const tab=TAB_ALIAS[(parts[0]||'').toLowerCase()];
+  let range=null;
+  if(qs){
+    try{const p=new URLSearchParams(qs),r=p.get('range');if(RANGE_VALUES.indexOf(r)>=0)range=r;}catch(_){}
+  }
+  if(!tab)return {tab:firstVisibleTab(),view:VIEWS[firstVisibleTab()][0].id,range:null,invalid:true};
+  let view=parts[1]||null;
+  if(!view||!VIEWS[tab].some(v=>v.id===view))view=VIEWS[tab][0].id;
+  return {tab:tab,view:view,range:range};
+}
+function syncHash(mode){
+  const h=hashForState();
+  if(location.hash===h)return;
+  try{history[mode==='replace'?'replaceState':'pushState'](null,'',h);}
+  catch(_){location.hash=h.slice(1);}
+}
+function syncPresetButtons(){
+  [['opencode','data-r',RANGE],['router','data-rr',RRANGE],['cline','data-cr',CRANGE]].forEach(([tab,attr,val])=>{
+    document.querySelectorAll('.pbtn['+attr+']').forEach(b=>{
+      const on=b.getAttribute(attr)===val;
+      b.classList.toggle('active',on);
+      b.setAttribute('aria-pressed',on?'true':'false');
+    });
+  });
+}
+function updateChrome(){
+  const list=VIEWS[TAB]||VIEWS.opencode;
+  const view=list.find(v=>v.id===SUBVIEW[TAB])||list[0];
+  if($('crumb-harness'))$('crumb-harness').textContent=HARNESS_NAME[TAB];
+  if($('crumb-view'))$('crumb-view').textContent=view.label;
+  document.title=HARNESS_NAME[TAB]+' · '+view.label+' — OpenCode Dashboard';
+  syncPresetButtons();
+}
+function renderViewNav(){
+  const list=VIEWS[TAB]||[],active=SUBVIEW[TAB],name=HARNESS_NAME[TAB];
+  if($('rail-view-kicker'))$('rail-view-kicker').textContent='Views · '+name;
+  if($('rail-views')){
+    $('rail-views').innerHTML=list.map(v=>'<button class="rail-item view-link'+(v.id===active?' active':'')+'" data-view="'+ESC(v.id)+'" title="'+ESC(v.label)+'" aria-label="'+ESC(name+' '+v.label)+'"'+(v.id===active?' aria-current="page"':'')+'>'+
+      '<span class="ri-ico" aria-hidden="true">'+ESC(v.icon)+'</span><span class="ri-label">'+ESC(v.label)+'</span></button>').join('');
+  }
+  if($('subnav')){
+    $('subnav').innerHTML=list.map(v=>'<button type="button" class="subnav-btn'+(v.id===active?' active':'')+'" data-view="'+ESC(v.id)+'" role="tab" aria-selected="'+(v.id===active?'true':'false')+'">'+ESC(v.label)+'</button>').join('');
+  }
+}
+function activateTabDom(){
+  ['opencode','router','cline','recap'].forEach(t=>{
+    const btn=$('tab-'+t),view=$('view-'+t),rail=$('rail-tab-'+t),on=t===TAB;
+    if(btn){btn.classList.toggle('active',on);btn.setAttribute('aria-selected',on?'true':'false');}
+    if(rail){rail.classList.toggle('active',on);if(on)rail.setAttribute('aria-current','page');else rail.removeAttribute('aria-current');}
+    if(view)view.hidden=!on;
+  });
+}
+function showSubviewDom(){
+  const active=SUBVIEW[TAB];
+  document.querySelectorAll('#view-opencode .subview,#view-router .subview,#view-cline .subview,#view-recap .subview').forEach(sv=>{
+    const view=sv.parentElement;
+    const on=view&&view.id==='view-'+TAB&&sv.dataset.sub===active;
+    sv.classList.toggle('active',on);
+    sv.hidden=!on;
+  });
+}
+function renderTab(){
+  if(TAB==='router')renderRouter();
+  else if(TAB==='cline')renderCline();
+  else if(TAB==='recap')renderRecap();
+  else renderAll();
+}
+function applyState(tab,view,range,historyMode){
+  // Explicit deep links may target a harness hidden by focus mode: render it
+  // with a dismissible note instead of silently redirecting.
+  if(!VIEWS[tab]){tab=firstVisibleTab();view=VIEWS[tab][0].id;}
+  const list=VIEWS[tab];
+  if(!view||!list.some(v=>v.id===view))view=SUBVIEW[tab];
+  if(!view||!list.some(v=>v.id===view))view=list[0].id;
+  TAB=tab;SUBVIEW[tab]=view;
+  if(range)setTabRange(tab,range);
+  try{sessionStorage.setItem('ocd-tab',tab);}catch(_){}
+  try{sessionStorage.setItem('ocd-subview',JSON.stringify(SUBVIEW));}catch(_){}
+  if(TAB==='opencode')FOCUS_NOTE_DISMISSED=false;
+  activateTabDom();showSubviewDom();renderViewNav();updateChrome();
+  updateFocusNote();
+  renderTab();
+  if(historyMode)syncHash(historyMode);
+}
+function setTab(name){
+  applyState(name,SUBVIEW[name]||VIEWS[name][0].id,null,'push');
+}
+function setSubview(name){
+  if(!VIEWS[TAB].some(v=>v.id===name)||SUBVIEW[TAB]===name)return;
+  applyState(TAB,name,null,'push');
+}
+function onHistoryRoute(){
+  const route=parseHash(location.hash);
+  if(!route)return;
+  if(route.tab===TAB&&route.view===SUBVIEW[TAB]&&(route.range||'all')===tabRange(TAB))return;
+  applyState(route.tab,route.view,route.range||'all',null);
+}
+let ROUTED=false;
+let FOCUS_NOTE_DISMISSED=false;
+function updateFocusNote(){
+  const el=$('focus-note');
+  if(!el)return;
+  el.hidden=!(FOCUS&&TAB!=='opencode'&&!FOCUS_NOTE_DISMISSED);
+}
+function initRouting(){
+  let tab=null,view=null,range=null;
+  const route=parseHash(location.hash);
+  if(route){tab=route.tab;view=route.view;range=route.range;}
+  else if(FOCUS){
+    tab='opencode';
+    view=SUBVIEW.opencode||VIEWS.opencode[0].id;
+  }
+  else{
+    let saved=null;try{saved=sessionStorage.getItem('ocd-tab');}catch(_){}
+    if(saved&&VIEWS[saved]&&harnessVisible(saved))tab=saved;
+    else tab=firstVisibleTab();
+    view=SUBVIEW[tab]||VIEWS[tab][0].id;
+  }
+  applyState(tab,view,range,null);
+  ROUTED=true;
+  try{history.replaceState(null,'',hashForState());}catch(_){}
+  window.addEventListener('popstate',onHistoryRoute);
+  window.addEventListener('hashchange',onHistoryRoute);
+}
 function applyHarness(){
-  const map={opencode:'tab-opencode',router:'tab-router',cline:'tab-cline'};
-  for(const k in map){const el=$(map[k]);if(el)el.style.display=HARNESS[k]?'':'none';}
+  const map={opencode:['tab-opencode','rail-tab-opencode'],router:['tab-router','rail-tab-router'],cline:['tab-cline','rail-tab-cline'],recap:['tab-recap','rail-tab-recap']};
+  for(const k in map){
+    map[k].forEach(id=>{const el=$(id);if(el)el.style.display=harnessVisible(k)?'':'none';});
+  }
   try{
+    $('set-focus').checked=!!FOCUS;
     $('set-opencode').checked=!!HARNESS.opencode;
     $('set-router').checked=!!HARNESS.router;
     $('set-cline').checked=!!HARNESS.cline;
   }catch(_){}
   try{localStorage.setItem('ocd-harness',JSON.stringify(HARNESS));}catch(_){}
-  if(TAB==='opencode'&&!HARNESS.opencode)setTab(HARNESS.router?'router':(HARNESS.cline?'cline':'recap'));
-  else if(TAB==='router'&&!HARNESS.router)setTab(HARNESS.opencode?'opencode':(HARNESS.cline?'cline':'recap'));
-  else if(TAB==='cline'&&!HARNESS.cline)setTab(HARNESS.opencode?'opencode':(HARNESS.router?'router':'recap'));
+  try{localStorage.setItem('ocd-focus',FOCUS?'1':'0');}catch(_){}
+  updateFocusNote();
   updateTabCounts();
   if(TAB==='recap')renderRecap();
 }
 function updateTabCounts(){
+  const setCnt=(id,v)=>{const el=$(id);if(el)el.textContent=v;};
   try{
-    if(S&&S.totals)$('tab-opencode-cnt').textContent=FN(S.totals.tokens_total||0);
-    if(R&&R.totals)$('tab-router-cnt').textContent=F(R.totals.requests||0)+' req';
-    if(C&&C.totals)$('tab-cline-cnt').textContent=F(C.totals.requests||0)+' msg';
+    if(S&&S.totals){const v=FN(S.totals.tokens_total||0);setCnt('tab-opencode-cnt',v);setCnt('rail-cnt-opencode',v);}
+    if(R&&R.totals){const v=F(R.totals.requests||0)+' req';setCnt('tab-router-cnt',v);setCnt('rail-cnt-router',v);}
+    if(C&&C.totals){const v=F(C.totals.requests||0)+' msg';setCnt('tab-cline-cnt',v);setCnt('rail-cnt-cline',v);}
     const t=new Date().toLocaleDateString('en-CA');
-    $('tab-recap-cnt').textContent=FN(recapDayEntry(RECAP_DATE||t).total);
+    const rv=FN(recapDayEntry(RECAP_DATE||t).total);
+    setCnt('tab-recap-cnt',rv);setCnt('rail-cnt-recap',rv);
   }catch(_){}
-}
-function setTab(name){
-  TAB=name;
-  const tabs=['opencode','router','cline','recap'];
-  tabs.forEach(t=>{
-    const btn=$('tab-'+t), view=$('view-'+t);
-    const on=t===name;
-    if(btn){btn.classList.toggle('active',on);btn.setAttribute('aria-selected',on);}
-    if(view)view.hidden=!on;
-  });
-  try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(name==='router')renderRouter();
-  else if(name==='cline')renderCline();
-  else if(name==='recap')renderRecap();
-  else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -4417,7 +5131,7 @@ document.addEventListener('focusin',e=>{
 });
 document.addEventListener('focusout',()=>tipHide());
 document.addEventListener('click',e=>{
-  if(!e.target.closest('.export-wrap')){$('expmenu').classList.remove('open');$('setmenu').classList.remove('open');}
+  if(!e.target.closest('.export-wrap')){setExportOpen(false);setMenuOpen(false);}
   const el=e.target.closest?e.target.closest('[data-f]'):null;
   if(!el)return;
   const idx=el.dataset.f.indexOf('|');
@@ -4472,29 +5186,25 @@ document.addEventListener('click',e=>{
   else if(k==='ccs'){CCS_EXP=!CCS_EXP;renderClineCommitChart();}
 });
 document.querySelectorAll('.pbtn[data-r]').forEach(b=>b.onclick=()=>{
-  RANGE=b.dataset.r;
-  document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x===b));
-  renderAll();
+  RANGE=b.dataset.r;syncPresetButtons();renderAll();syncHash('push');
 });
 $('split-btn').onclick=()=>{SPLIT=!SPLIT;$('split-btn').textContent='Split reasoning: '+(SPLIT?'on':'off');$('split-btn').setAttribute('aria-pressed',SPLIT);renderAll();};
 $('share-btn').onclick=()=>{SHARE=!SHARE;$('share-btn').textContent='Share: '+(SHARE?'on':'off');$('share-btn').setAttribute('aria-pressed',SHARE);renderAll();};
 document.querySelectorAll('.pbtn[data-rr]').forEach(b=>b.onclick=()=>{
-  RRANGE=b.dataset.rr;
-  document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x===b));
-  renderRouter();
+  RRANGE=b.dataset.rr;syncPresetButtons();renderRouter();syncHash('push');
 });
 $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split reasoning: '+(RSPLIT?'on':'off');$('r-split-btn').setAttribute('aria-pressed',RSPLIT);renderRouter();};
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
 document.querySelectorAll('.pbtn[data-cr]').forEach(b=>b.onclick=()=>{
-  CRANGE=b.dataset.cr;
-  document.querySelectorAll('.pbtn[data-cr]').forEach(x=>x.classList.toggle('active',x===b));
-  renderCline();
+  CRANGE=b.dataset.cr;syncPresetButtons();renderCline();syncHash('push');
 });
 $('c-share-btn').onclick=()=>{CSHARE=!CSHARE;$('c-share-btn').textContent='Share: '+(CSHARE?'on':'off');$('c-share-btn').setAttribute('aria-pressed',CSHARE);renderCline();};
-$('tab-opencode').onclick=()=>setTab('opencode');
-$('tab-router').onclick=()=>setTab('router');
-$('tab-cline').onclick=()=>setTab('cline');
-$('tab-recap').onclick=()=>setTab('recap');
+document.addEventListener('click',e=>{
+  const h=e.target.closest?e.target.closest('[data-harness]'):null;
+  if(h){e.preventDefault();setTab(h.dataset.harness);return;}
+  const v=e.target.closest?e.target.closest('[data-view]'):null;
+  if(v){e.preventDefault();setSubview(v.dataset.view);}
+});
 $('c-search').addEventListener('input',renderClineSessions);
 $('c-provider-f').addEventListener('change',e=>{CFSTATE.provider=e.target.value||null;renderCline();});
 $('c-model-f').addEventListener('change',e=>{CFSTATE.model=e.target.value||null;renderCline();});
@@ -4536,7 +5246,31 @@ $('recap-copy').onclick=async()=>{
   }
 };
 /* harness settings */
-$('settings').onclick=e=>{e.stopPropagation();$('setmenu').classList.toggle('open');};
+function setMenuOpen(open){
+  $('setmenu').classList.toggle('open',open);
+  $('settings').setAttribute('aria-expanded',open?'true':'false');
+}
+function openSettingsMenu(){
+  setMenuOpen(true);
+  const first=$('set-opencode');if(first)first.focus();
+}
+$('settings').onclick=e=>{e.stopPropagation();const open=!$('setmenu').classList.contains('open');setExportOpen(false);setMenuOpen(open);};
+$('set-focus').addEventListener('change',e=>{
+  FOCUS=!!e.target.checked;
+  FOCUS_NOTE_DISMISSED=false;
+  if(FOCUS){
+    HARNESS.opencode=true;
+    applyHarness();
+    applyState('opencode','overview',null,'push');
+  }else{
+    // Turning focus off reveals every harness immediately; individual
+    // checkboxes can then be used to hide them again.
+    HARNESS={opencode:true,router:true,cline:true};
+    applyHarness();
+  }
+  $('set-focus').checked=FOCUS;
+});
+$('focus-note-x').onclick=()=>{FOCUS_NOTE_DISMISSED=true;updateFocusNote();};
 [['set-opencode','opencode'],['set-router','router'],['set-cline','cline']].forEach(([id,key])=>{
   $(id).addEventListener('change',e=>{
     if(!e.target.checked){
@@ -4545,6 +5279,7 @@ $('settings').onclick=e=>{e.stopPropagation();$('setmenu').classList.toggle('ope
     }
     HARNESS[key]=e.target.checked;
     applyHarness();
+    if(ROUTED&&!harnessVisible(TAB))setTab(firstVisibleTab());
   });
 });
 $('r-search').addEventListener('input',renderRouterRequests);
@@ -4569,6 +5304,20 @@ $('tbl').addEventListener('keydown',e=>{if(e.key!=='Enter'&&e.key!==' '&&e.key!=
   const s=currentRows[+tr.dataset.i];if(s)openSession(s);});
 document.querySelectorAll('#tbl th').forEach(th=>{th.onclick=sortH;th.tabIndex=0;th.setAttribute('role','button');
   th.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();sortH(e);}});});
+/* keyboard activation for SVG day cells (heatmap cells are real buttons) */
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Enter'&&e.key!==' '&&e.key!=='Spacebar')return;
+  const cell=e.target.closest?e.target.closest('svg [data-f],svg [data-cday]'):null;
+  if(!cell)return;
+  e.preventDefault();
+  cell.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+});
+document.querySelector('.skip').addEventListener('click',e=>{
+  e.preventDefault();
+  const main=$('main');if(!main)return;
+  main.focus();
+  main.scrollIntoView();
+});
 /* export */
 function exportData(kind){
   const isR=TAB==='router'&&R;
@@ -4602,8 +5351,174 @@ function exportData(kind){
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='opencode-tokens-days.csv';a.click();
   }
 }
-$('export').onclick=e=>{e.stopPropagation();$('expmenu').classList.toggle('open');};
-document.querySelectorAll('#expmenu button').forEach(b=>b.onclick=()=>{exportData(b.dataset.x);$('expmenu').classList.remove('open');});
+function setExportOpen(open){
+  $('expmenu').classList.toggle('open',open);
+  $('export').setAttribute('aria-expanded',open?'true':'false');
+}
+$('export').onclick=e=>{e.stopPropagation();const open=!$('expmenu').classList.contains('open');setMenuOpen(false);setExportOpen(open);};
+document.querySelectorAll('#expmenu button').forEach(b=>b.onclick=()=>{exportData(b.dataset.x);setExportOpen(false);});
+/* command palette */
+let PALETTE_OPEN=false,PAL_ITEMS=[],PAL_ACTIVE=0,paletteReturnFocus=null;
+function palScore(item,q){
+  if(!q)return 0;
+  const label=(item.label||'').toLowerCase();
+  const idx=label.indexOf(q);
+  if(idx>=0)return 200-idx+(idx===0?60:0);
+  const hay=((item.label||'')+' '+(item.hint||'')+' '+(item.terms||'')).toLowerCase();
+  const at=hay.indexOf(q);
+  return at>=0?80-Math.min(at,60):-1;
+}
+function buildPalette(query){
+  const q=(query||'').trim().toLowerCase();
+  const nav=[],ranges=[],actions=[],sessions=[];
+  const tabs=['opencode','router','cline'].filter(t=>harnessVisible(t));
+  if(harnessVisible('recap'))tabs.push('recap');
+  tabs.forEach(t=>{
+    nav.push({label:'Go to '+HARNESS_NAME[t],hint:'Harness',terms:HARNESS_NAME[t]+' harness '+t+' tab',
+      run:()=>{closePalette();applyState(t,SUBVIEW[t]||VIEWS[t][0].id,null,'push');}});
+    VIEWS[t].forEach(v=>{
+      nav.push({label:HARNESS_NAME[t]+' · '+v.label,hint:'View',terms:HARNESS_NAME[t]+' '+v.label+' '+v.id+' view',
+        run:()=>{closePalette();applyState(t,v.id,null,'push');}});
+    });
+  });
+  if(TAB!=='recap'){
+    [['7','7 days'],['30','30 days'],['90','90 days'],['all','All time']].forEach(([r,lbl])=>{
+      ranges.push({label:'Range · '+lbl,hint:HARNESS_NAME[TAB],terms:'range period '+lbl+' '+r,
+        key:tabRange(TAB)===r?'●':'',
+        run:()=>{closePalette();setTabRange(TAB,r);syncPresetButtons();renderTab();syncHash('push');}});
+    });
+  }
+  actions.push({label:'Toggle theme',hint:'Light / dark appearance',terms:'theme dark light appearance',key:'',
+    run:()=>{closePalette();toggleTheme();}});
+  actions.push({label:'Refresh data',hint:'Reload every harness',terms:'refresh reload update',key:'',
+    run:()=>{closePalette();load();}});
+  actions.push({label:'Export JSON',hint:'Full stats payload',terms:'export download json data',key:'',
+    run:()=>{closePalette();exportData('json');}});
+  actions.push({label:'Export CSV',hint:'Per-day usage table',terms:'export download csv days',key:'',
+    run:()=>{closePalette();exportData('csv');}});
+  actions.push({label:'Export Recap CSV',hint:'All harnesses per day',terms:'export download recap csv harnesses',key:'',
+    run:()=>{closePalette();exportData('recap');}});
+  actions.push({label:'Harness settings',hint:'Show or hide harnesses',terms:'settings harness toggle gear configure',key:'',
+    run:()=>{closePalette();openSettingsMenu();}});
+  actions.push({label:'Help',hint:'Keyboard shortcuts',terms:'help shortcuts keyboard guide',key:'?',
+    run:()=>{closePalette();openHelp();}});
+  if(q&&S&&S.sessions){
+    S.sessions.forEach(s=>{
+      const title=s.title||'Untitled',model=s.model||'';
+      const hit=palScore({label:title,terms:model},q);
+      if(hit<0)return;
+      const tot=s.tokens_total||((s.tokens_input||0)+(s.tokens_output||0)+(s.tokens_reasoning||0)+(s.tokens_cache||0));
+      sessions.push({label:title,hint:modelShort(model)+' · '+FN(tot)+' tokens',terms:model,_score:hit,
+        run:()=>{closePalette();openSession(s);}});
+    });
+    sessions.sort((a,b)=>b._score-a._score);
+    sessions.splice(6);
+  }
+  const groups=[{label:'Navigate',items:nav},{label:'Range',items:ranges},{label:'Actions',items:actions},{label:'Sessions',items:sessions}];
+  groups.forEach(g=>{
+    if(q){
+      g.items.forEach(it=>{it._score=palScore(it,q);});
+      g.items=g.items.filter(it=>it._score>=0).sort((a,b)=>b._score-a._score);
+    }
+  });
+  return groups.filter(g=>g.items.length);
+}
+function updatePaletteActive(){
+  const list=$('palette-list');if(!list)return;
+  list.querySelectorAll('[data-pal-idx]').forEach(el=>{
+    const on=Number(el.dataset.palIdx)===PAL_ACTIVE;
+    el.classList.toggle('active',on);
+    el.setAttribute('aria-selected',on?'true':'false');
+  });
+  const active=list.querySelector('[data-pal-idx="'+PAL_ACTIVE+'"]');
+  if(active&&active.scrollIntoView)active.scrollIntoView({block:'nearest'});
+}
+function renderPalette(){
+  const groups=buildPalette($('palette-input').value);
+  let flat=[];
+  groups.forEach(g=>g.items.forEach(it=>{it._i=flat.length;flat.push(it);}));
+  PAL_ITEMS=flat;
+  if(PAL_ACTIVE>=flat.length)PAL_ACTIVE=Math.max(0,flat.length-1);
+  if(!flat.length){$('palette-list').innerHTML='<div class="pal-empty">No matches.</div>';return;}
+  let html='';
+  groups.forEach(g=>{
+    if(!g.items.length)return;
+    html+='<div class="pal-group"><div class="pal-group-label">'+ESC(g.label)+'</div>';
+    g.items.forEach(it=>{
+      const on=it._i===PAL_ACTIVE;
+      html+='<button type="button" class="pal-item'+(on?' active':'')+'" data-pal-idx="'+it._i+'" role="option" aria-selected="'+(on?'true':'false')+'">'+
+        '<span class="pal-main"><span class="pal-label">'+ESC(it.label)+'</span>'+(it.hint?'<span class="pal-hint">'+ESC(it.hint)+'</span>':'')+'</span>'+
+        (it.key?'<span class="pal-key">'+ESC(it.key)+'</span>':'')+'</button>';
+    });
+    html+='</div>';
+  });
+  $('palette-list').innerHTML=html;
+}
+function paletteMove(delta){
+  if(!PAL_ITEMS.length)return;
+  PAL_ACTIVE=(PAL_ACTIVE+delta+PAL_ITEMS.length)%PAL_ITEMS.length;
+  updatePaletteActive();
+}
+function paletteRun(i){
+  const it=PAL_ITEMS[i];if(!it)return;
+  it.run();
+}
+function openPalette(){
+  if(PALETTE_OPEN)return;
+  paletteReturnFocus=document.activeElement;
+  PALETTE_OPEN=true;PAL_ACTIVE=0;
+  $('palette').hidden=false;
+  $('palette-btn').setAttribute('aria-expanded','true');
+  $('rail-palette').setAttribute('aria-expanded','true');
+  $('palette-input').setAttribute('aria-expanded','true');
+  $('palette-input').value='';
+  renderPalette();
+  $('palette-input').focus();
+}
+function closePalette(){
+  if(!PALETTE_OPEN)return;
+  PALETTE_OPEN=false;
+  $('palette').hidden=true;
+  $('palette-btn').setAttribute('aria-expanded','false');
+  $('rail-palette').setAttribute('aria-expanded','false');
+  $('palette-input').setAttribute('aria-expanded','false');
+  if(paletteReturnFocus&&paletteReturnFocus.focus)paletteReturnFocus.focus();
+}
+function togglePalette(){PALETTE_OPEN?closePalette():openPalette();}
+$('palette-btn').onclick=openPalette;
+$('rail-palette').onclick=openPalette;
+$('palette-close').onclick=closePalette;
+$('palette-input').addEventListener('input',()=>{PAL_ACTIVE=0;renderPalette();});
+$('palette').addEventListener('click',e=>{if(e.target.id==='palette')closePalette();});
+$('palette-list').addEventListener('mousemove',e=>{
+  const b=e.target.closest?e.target.closest('[data-pal-idx]'):null;
+  if(!b)return;
+  const i=Number(b.dataset.palIdx);
+  if(i!==PAL_ACTIVE){PAL_ACTIVE=i;updatePaletteActive();}
+});
+$('palette-list').addEventListener('click',e=>{
+  const b=e.target.closest?e.target.closest('[data-pal-idx]'):null;
+  if(b)paletteRun(Number(b.dataset.palIdx));
+});
+$('palette').addEventListener('keydown',e=>{
+  if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closePalette();return;}
+  if(e.key==='ArrowDown'){e.preventDefault();paletteMove(1);return;}
+  if(e.key==='ArrowUp'){e.preventDefault();paletteMove(-1);return;}
+  if(e.key==='Enter'){
+    if(e.target.id==='palette-close')return;
+    e.preventDefault();paletteRun(PAL_ACTIVE);
+  }
+});
+/* help */
+function openHelp(){
+  lastFocus=document.activeElement;
+  $('help-overlay').classList.add('open');
+  const x=$('help-close');if(x)x.focus();
+}
+function closeHelp(){closeOverlay('help-overlay');}
+$('rail-help').onclick=openHelp;
+$('help-close').onclick=closeHelp;
+$('help-overlay').onclick=e=>{if(e.target.id==='help-overlay')closeHelp();};
 /* stop the hidden server when this window closes or quits (Cmd+Q) */
 function stopServer(){try{navigator.sendBeacon&&navigator.sendBeacon('/api/close?wid='+WID);}catch(e){try{fetch('/api/close?wid='+WID,{method:'POST',keepalive:true});}catch(_){}}}
 window.addEventListener('beforeunload',stopServer);
@@ -4613,9 +5528,14 @@ function closeOverlay(id){const ov=$(id);if(ov&&ov.classList.contains('open')){o
 $('overlay').onclick=e=>{if(e.target.id==='overlay')closeOverlay('overlay');};
 $('modal').addEventListener('click',e=>{if(e.target.classList.contains('modal-x'))closeOverlay('overlay');});
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){closeOverlay('overlay');return;}
+  if((e.metaKey||e.ctrlKey)&&!e.altKey&&(e.key==='k'||e.key==='K')){e.preventDefault();togglePalette();return;}
+  if(e.key==='Escape'){
+    if(PALETTE_OPEN){closePalette();return;}
+    if($('help-overlay').classList.contains('open')){closeHelp();return;}
+    closeOverlay('overlay');return;
+  }
   if(e.key==='Tab'){
-    const open=$('overlay').classList.contains('open')?$('overlay'):null;
+    const open=PALETTE_OPEN?$('palette'):($('help-overlay').classList.contains('open')?$('help-overlay'):($('overlay').classList.contains('open')?$('overlay'):null));
     if(!open)return;
     const els=[...open.querySelectorAll('button,input,select,a,[tabindex]')].filter(el=>!el.disabled&&el.tabIndex>=0);
     if(!els.length)return;
@@ -4647,16 +5567,9 @@ $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
 setInterval(()=>{if(!document.hidden)load();},30000);
 applyHarness();
-try{
-  const saved=sessionStorage.getItem('ocd-tab');
-  if(saved==='router'||saved==='cline'||saved==='recap')setTab(saved);
-  else if(!HARNESS.opencode)setTab(HARNESS.router?'router':(HARNESS.cline?'cline':'recap'));
-}catch(_){}
 try{$('recap-picker').value=RECAP_DATE;}catch(_){}
-if(S){renderAll();$('status').textContent='Updated just now';}
-if(R){renderRouter();}
-if(C){renderCline();}
-renderRecap();
+initRouting();
+if(S){$('status').textContent='Updated just now';}
 load();
 </script>
 </body>
@@ -5186,8 +6099,9 @@ def tui_model_badge(model_row, cost_idx=7):
     Codex/Cline rows (Codex: what-if paid cost; Cline: 0, it records no
     per-model cost). Index 11 is the free flag when the payload has one.
 
-    The synthetic recovered-history row named `Other` never gets a free/$0
-    badge: it is recovered usage, not a free model.
+    Legacy payloads may still contain a synthetic `Other` row; new payloads
+    do not. Such a row never gets a free/$0 badge: it is recovered usage, not
+    a free model.
     """
     if not isinstance(model_row, (list, tuple)) or not model_row:
         return ""
@@ -5204,7 +6118,11 @@ def tui_model_badge(model_row, cost_idx=7):
 
 
 def tui_recovered_badge(model_row):
-    """'recovered' for the synthetic `Other` model row, '' otherwise."""
+    """'recovered' for a legacy synthetic `Other` row, '' otherwise.
+
+    New payloads report recovered history as a top-level `recovered` block,
+    not as a model row; this remains for old saved payloads.
+    """
     if not isinstance(model_row, (list, tuple)) or not model_row:
         return ""
     return "recovered" if str(model_row[0] or "").strip().lower() == "other" else ""
@@ -5235,6 +6153,244 @@ def tui_free_model_count(models, cost_idx=7):
 
 TUI_HARNESS_KEYS = ("opencode", "router", "cline")
 TUI_HARNESS_NAMES = ("OpenCode", "Codex", "Cline")
+TUI_HARNESS_SHORT = ("OC", "CX", "CL")
+
+# First run is OpenCode-first: the other harnesses stay one `h` away instead
+# of diluting the default view.
+TUI_DEFAULT_VISIBILITY = {"opencode": True, "router": False, "cline": False}
+
+
+def tui_initial_visibility(pref):
+    """Visibility for a fresh ledger (None) or an explicit saved preference.
+
+    Only a missing preference uses the OpenCode-first default. Any stored
+    value (including a corrupt one) goes through the normalizer, so explicit
+    saved maps always win and legacy all-visible values keep their meaning.
+    """
+    if pref is None:
+        return dict(TUI_DEFAULT_VISIBILITY)
+    return tui_harness_visibility(pref)
+
+
+def tui_tab_items(visible):
+    """Visible tab bar items as (tab_index, full_name, short_name)."""
+    vis = tui_harness_visibility(visible)
+    items = [
+        (i, TUI_HARNESS_NAMES[i], TUI_HARNESS_SHORT[i])
+        for i, key in enumerate(TUI_HARNESS_KEYS)
+        if vis[key]
+    ]
+    items.append((3, "Recap", "RC"))
+    return items
+
+
+def tui_tab_for_key(key, visible):
+    """Tab index for a digit key over the visible tab bar, or None."""
+    if not isinstance(key, int) or not (ord("1") <= key <= ord("9")):
+        return None
+    items = tui_tab_items(visible)
+    idx = key - ord("1")
+    if 0 <= idx < len(items):
+        return items[idx][0]
+    return None
+
+
+def _tui_token_buckets():
+    return {"input": 0.0, "output": 0.0, "reasoning": 0.0,
+            "cache": 0.0, "cost": 0.0, "total": 0.0}
+
+
+def tui_token_split(stats):
+    """Separate recorded usage from recovered-history metadata.
+
+    `recorded` is what the live ledger actually recorded; `recovered` is the
+    historical backfill exposed as metadata only, so totals never double count
+    it. Older payloads folded the recovery into `totals`; those are unfolded
+    here unless `included_in_totals` is false. Never raises.
+    """
+    out = {"recorded": _tui_token_buckets(),
+           "recovered": _tui_token_buckets(),
+           "has_recovered": False}
+    if not isinstance(stats, dict):
+        return out
+    totals = stats.get("totals")
+    if not isinstance(totals, dict):
+        totals = {}
+    rec = stats.get("recovered")
+    if not isinstance(rec, dict):
+        rec = {}
+
+    recovered = _tui_token_buckets()
+    recovered["input"] = num(rec.get("tokens_input"))
+    recovered["output"] = num(rec.get("tokens_output"))
+    recovered["reasoning"] = num(rec.get("tokens_reasoning"))
+    recovered["cache"] = num(rec.get("tokens_cache"))
+    if not recovered["cache"]:
+        recovered["cache"] = (num(rec.get("tokens_cache_read"))
+                              + num(rec.get("tokens_cache_write")))
+    recovered["total"] = num(rec.get("tokens_total"))
+    if recovered["total"] <= 0:
+        recovered["total"] = (recovered["input"] + recovered["output"]
+                              + recovered["reasoning"] + recovered["cache"])
+
+    recorded = _tui_token_buckets()
+    recorded["input"] = num(totals.get("tokens_input"))
+    recorded["output"] = num(totals.get("tokens_output"))
+    recorded["reasoning"] = num(totals.get("tokens_reasoning"))
+    recorded["cache"] = (num(totals.get("tokens_cache_read"))
+                         + num(totals.get("tokens_cache_write")))
+    recorded["cost"] = num(totals.get("cost"))
+    has_recorded_total = "tokens_total_recorded" in totals
+    recorded["total"] = num(totals.get("tokens_total_recorded") if has_recorded_total
+                            else totals.get("tokens_total"))
+
+    # Legacy payload: `totals` already include the recovered backfill.
+    if (not has_recorded_total and recovered["total"] > 0
+            and bool(rec.get("included_in_totals", True))):
+        for key in ("input", "output", "reasoning", "cache"):
+            recorded[key] = max(0.0, recorded[key] - recovered[key])
+        recorded["total"] = max(0.0, recorded["total"] - recovered["total"])
+
+    out["recorded"] = recorded
+    out["recovered"] = recovered
+    out["has_recovered"] = recovered["total"] > 0
+    return out
+
+
+def tui_visible_models(models):
+    """Model rows that are real models (recovered metadata is not a model)."""
+    if not models:
+        return []
+    out = []
+    for row in models:
+        if not isinstance(row, (list, tuple)):
+            continue
+        if tui_recovered_badge(row):
+            continue
+        out.append(row)
+    return out
+
+
+def tui_forecast(rows, window=7, horizon=7, today=None):
+    """Zero-filled calendar forecast from day rows (never raises).
+
+    Averages over exactly `window` calendar days ending at the latest valid
+    date <= `today`, then projects `horizon` days at that average. `basis` is
+    the number of days in the window that actually had activity.
+    """
+    win = int(num(window))
+    hor = int(num(horizon))
+    out = {"avg": 0.0, "projected": 0.0, "recorded": 0.0,
+           "window": max(0, win), "horizon": max(0, hor),
+           "end": "", "basis": 0, "ok": False}
+    if win <= 0 or hor < 0:
+        return out
+
+    if today is None:
+        end_cap = datetime.now().date()
+    elif isinstance(today, datetime):
+        end_cap = today.date()
+    else:
+        try:
+            end_cap = datetime.strptime(str(today)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            end_cap = datetime.now().date()
+
+    by_day = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = datetime.strptime(str(row.get("date"))[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        if day > end_cap:
+            continue
+        tokens = (num(row.get("ti")) + num(row.get("to"))
+                  + num(row.get("tr")) + num(row.get("cache")))
+        by_day[day] = by_day.get(day, 0.0) + tokens
+    if not by_day:
+        return out
+
+    end = max(by_day)
+    start = end - timedelta(days=win - 1)
+    recorded = 0.0
+    basis = 0
+    for i in range(win):
+        day = start + timedelta(days=i)
+        if day in by_day:
+            recorded += by_day[day]
+            basis += 1
+    avg = recorded / win
+    out.update({
+        "avg": avg,
+        "projected": avg * hor,
+        "recorded": recorded,
+        "end": end.isoformat(),
+        "basis": basis,
+        "ok": True,
+    })
+    return out
+
+
+def tui_chart_header(total, vmax, n, fc, width):
+    """One-line chart header that always fits `width`."""
+    width = max(0, int(num(width)))
+    fc = fc if isinstance(fc, dict) else {}
+    win = int(num(fc.get("window", 7))) or 7
+    hor = int(num(fc.get("horizon", 7))) or 7
+    legacy = f"total {_fmt(total)}  peak {_fmt(vmax)}  days {int(num(n))}"
+    if not fc.get("ok", True):
+        text = legacy
+    elif width >= 50:
+        text = (f"total {_fmt(total)}  {win}d avg {_fmt(num(fc.get('avg')))}"
+                f"  next {hor}d ~{_fmt(num(fc.get('projected')))}")
+    elif width >= 30:
+        text = (f"total {_fmt(total)}  next {hor}d ~"
+                f"{_fmt(num(fc.get('projected')))}")
+    else:
+        text = legacy
+    return tui_fit(text, width)
+
+
+def tui_insight_rows(stats):
+    """Insight modal rows from structured cards or legacy strings."""
+    rows = []
+    if not isinstance(stats, dict):
+        return rows
+    split = tui_token_split(stats)
+    if split["has_recovered"]:
+        rows.append({
+            "title": "Recovered history",
+            "value": _fmt(split["recovered"]["total"]),
+            "detail": "metadata only — not in recorded totals",
+        })
+    cards = stats.get("insight_cards")
+    if isinstance(cards, (list, tuple)):
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            title = card.get("title")
+            value = card.get("value")
+            detail = card.get("detail")
+            if not any(str(v).strip() for v in (title, value, detail) if v is not None):
+                continue
+            rows.append({
+                "title": "" if title is None else str(title),
+                "value": "" if value is None else str(value),
+                "detail": "" if detail is None else str(detail),
+            })
+    else:
+        legacy = stats.get("insights")
+        if isinstance(legacy, (list, tuple)):
+            for text in legacy:
+                if text is None:
+                    continue
+                text = str(text).strip()
+                if not text:
+                    continue
+                rows.append({"title": "", "value": "", "detail": text})
+    return rows[:12]
 
 
 def tui_today_totals(stats):
@@ -5371,14 +6527,19 @@ def run_tui(args):
     G = _init_glyphs()
 
     def load_harness_visibility():
-        """Ledger-stored harness visibility, defaulting to all visible."""
-        default = {key: True for key in TUI_HARNESS_KEYS}
+        """Ledger-stored visibility; a fresh ledger shows OpenCode only.
+
+        The default is never written back: an untouched ledger keeps reading
+        as a first run, while any saved map (including a legacy all-visible
+        one) wins over the default.
+        """
         try:
             if not Path(args.db).exists():
-                return default
-            return tui_harness_visibility(ledger_get_pref(args.db, "harness_visibility"))
+                return tui_initial_visibility(None)
+            return tui_initial_visibility(
+                ledger_get_pref(args.db, "harness_visibility"))
         except Exception:
-            return default
+            return tui_initial_visibility(None)
 
     state = {
         "tab": 0, "S": None, "R": None, "C": None,
@@ -5388,7 +6549,6 @@ def run_tui(args):
         "range_idx": 1, "loading": False, "spinner": 0,
         "visible": load_harness_visibility(),
     }
-    tabs = ["OpenCode", "Codex", "Cline", "Recap"]
     render = {"pal": None}
 
     def visible_order():
@@ -5554,6 +6714,45 @@ def run_tui(args):
             if not S:
                 return [_no_data_card("OpenCode", pal)]
             p = tui_period_totals(S, days)
+            split = tui_token_split(S)
+            rec_tokens = split["recorded"]
+            rec_meta = split["recovered"]
+            if days:
+                # Day rows never include recovered history, so the range view
+                # is recorded by construction.
+                tok_total = p["tokens_total"]
+                tok_bar = [("acc", p["ti"]), ("acc2", p["to"]),
+                           ("mag", p["tr"]), ("warn", p["cache"])]
+                tok_details = [
+                    ("input", _fmt(p["ti"])),
+                    ("output", _fmt(p["to"])),
+                    ("reasoning", _fmt(p["tr"])),
+                    ("cache", _fmt(p["cache"])),
+                ]
+            else:
+                # All: use the split so ledger-only recorded sessions count
+                # even when they have no day rows.
+                tok_total = rec_tokens["total"]
+                tok_bar = [("acc", rec_tokens["input"]),
+                           ("acc2", rec_tokens["output"]),
+                           ("mag", rec_tokens["reasoning"]),
+                           ("warn", rec_tokens["cache"])]
+                tok_details = [
+                    ("input", _fmt(rec_tokens["input"])),
+                    ("output", _fmt(rec_tokens["output"])),
+                    ("reasoning", _fmt(rec_tokens["reasoning"])),
+                    ("cache", _fmt(rec_tokens["cache"])),
+                ]
+            tokens_card = {
+                "title": "Tokens · recorded",
+                "value": _fmt(tok_total),
+                "value_attr": pal["acc"] | BOLD,
+                "bar": tok_bar,
+                "details": tok_details,
+            }
+            if split["has_recovered"]:
+                tokens_card["subvalue"] = f"rec {_fmt(rec_meta['total'])}"
+                tokens_card["subvalue_attr"] = pal["warn"] | BOLD
             rec = (S.get("records") or {})
             streaks = rec.get("streaks") or {}
             big = rec.get("biggest_day") or {}
@@ -5561,7 +6760,7 @@ def run_tui(args):
             today = tui_today_totals(S)
             return [
                 {
-                    "title": "Today",
+                    "title": "Today (recorded)",
                     "value": _fmt(today["tokens_total"]),
                     "value_attr": pal["mag"] | BOLD,
                     "details": [
@@ -5570,19 +6769,7 @@ def run_tui(args):
                         ("sessions", str(today["sessions"])),
                     ],
                 },
-                {
-                    "title": "Tokens",
-                    "value": _fmt(p["tokens_total"]),
-                    "value_attr": pal["acc"] | BOLD,
-                    "bar": [("acc", p["ti"]), ("acc2", p["to"]),
-                            ("mag", p["tr"]), ("warn", p["cache"])],
-                    "details": [
-                        ("input", _fmt(p["ti"])),
-                        ("output", _fmt(p["to"])),
-                        ("reasoning", _fmt(p["tr"])),
-                        ("cache", _fmt(p["cache"])),
-                    ],
-                },
+                tokens_card,
                 {
                     "title": "Sessions",
                     "value": str(p["sessions"]),
@@ -5744,8 +6931,20 @@ def run_tui(args):
             if iw < 4:
                 continue
             yy = y + 1
-            put(win, yy, ix, tui_fit(card.get("value", ""), iw),
-                card.get("value_attr") or (pal["value"] | curses.A_BOLD))
+            value_attr = card.get("value_attr") or (pal["value"] | curses.A_BOLD)
+            value_txt = tui_fit(card.get("value", ""), iw)
+            sub_txt = card.get("subvalue")
+            if sub_txt:
+                sub_txt = tui_fit(str(sub_txt), iw, G["ell"])
+                # Only pair value + subvalue when they fit side by side.
+                if len(value_txt) + 1 + len(sub_txt) <= iw:
+                    put(win, yy, ix, value_txt, value_attr)
+                    put(win, yy, ix + iw - len(sub_txt), sub_txt,
+                        card.get("subvalue_attr") or (pal["warn"] | curses.A_BOLD))
+                else:
+                    put(win, yy, ix, value_txt, value_attr)
+            else:
+                put(win, yy, ix, value_txt, value_attr)
             yy += 1
             bar_parts = card.get("bar") or []
             if bar_parts and yy <= y + hh - 2:
@@ -5773,7 +6972,7 @@ def run_tui(args):
     # ---------------------------------------------------------------- chart
     def draw_chart(win, rect, rows, pal, range_label):
         y, x, hh, ww = rect
-        box(win, rect, f"Token activity {G['mid']} {range_label}", pal["border"],
+        box(win, rect, f"Recorded token activity {G['mid']} {range_label}", pal["border"],
             pal["acc"] | curses.A_BOLD)
         iw = ww - 4
         if iw < 8 or hh < 4:
@@ -5794,7 +6993,9 @@ def run_tui(args):
         cols = tui_scale_blocks(vals, iw)
         col_max = max(cols) or 1.0
         if hh >= 5:
-            put(win, y + 1, ix, f"total {_fmt(total)}   peak {_fmt(vmax)}   days {len(vals)}",
+            fc = tui_forecast(rows)
+            put(win, y + 1, ix,
+                tui_chart_header(total, vmax, len(vals), fc, iw),
                 pal["muted"])
             labels_y = y + hh - 2
             bar_bottom = labels_y - 1
@@ -5832,8 +7033,8 @@ def run_tui(args):
             return pal["good"] | curses.A_BOLD
         return pal["good"]
 
-    def draw_models(win, rect, models, pal, cost_idx=7):
-        """Top models table; `cost_idx` is 7 for OpenCode and 12 for Codex/Cline."""
+    def draw_models(win, rect, models, pal, cost_idx=7, recovered=0.0):
+        """Top models table; recovered history is metadata, never a model row."""
         y, x, hh, ww = rect
         box(win, rect, f"Top models {G['mid']} all time", pal["border"],
             pal["acc"] | curses.A_BOLD)
@@ -5841,14 +7042,25 @@ def run_tui(args):
         if iw < 10 or hh < 3:
             return
         ix = x + 2
-        rows = [m for m in (models or []) if isinstance(m, (list, tuple)) and len(m) >= 3]
+        # Legacy payloads may still contain a synthetic `Other` row; new
+        # payloads do not. Filter before ranking so it never sets vmax and
+        # never competes for a model slot.
+        rows = [m for m in tui_visible_models(models) if len(m) >= 3]
+        footer = ""
+        if num(recovered) > 0:
+            footer = f"+ rec {_fmt(recovered)} (metadata)"
+        visible = max(1, hh - 3)
+        if footer and hh >= 4:
+            visible = max(1, visible - 1)
         if not rows:
             put(win, y + 1, ix, "no model data", pal["muted"])
+            if footer and y + 2 <= y + hh - 2:
+                put(win, y + 2, ix, tui_fit(footer, iw, G["ell"]),
+                    pal["warn"] | curses.A_BOLD)
             return
         vmax = max(num(m[2]) for m in rows) or 1.0
         show_cost = iw >= 40
-        # the recovered "Other" row needs a wider badge cell than free/$0
-        badge_w = 9 if any(tui_recovered_badge(m) for m in rows) else 5
+        badge_w = 5
         if show_cost:
             tail_w = 7 + 2 + 7 + 2 + badge_w
         else:
@@ -5863,7 +7075,6 @@ def run_tui(args):
             put(win, y + 1, tail_x, f"{'tokens':>7}  {'cost':>7}", pal["muted"])
         else:
             put(win, y + 1, tail_x, f"{'tokens':>7}", pal["muted"])
-        visible = max(1, hh - 3)
         for i, m in enumerate(rows[:visible]):
             yy = y + 2 + i
             if yy > y + hh - 2:
@@ -5871,7 +7082,7 @@ def run_tui(args):
             name = str(m[0])
             tot = num(m[2])
             cost = num(m[cost_idx]) if len(m) > cost_idx else 0.0
-            badge = tui_model_badge(m, cost_idx) or tui_recovered_badge(m)
+            badge = tui_model_badge(m, cost_idx)
             put(win, yy, ix, tui_fit(name, name_w, G["ell"]),
                 pal["value"] if i == 0 else pal["dim"])
             if bar_w > 0:
@@ -5891,6 +7102,11 @@ def run_tui(args):
                 if badge:
                     put(win, yy, tail_x + 9, f"{badge:<{badge_w}}",
                         model_badge_attr(badge, pal))
+        if footer:
+            fy = y + 2 + min(len(rows), visible)
+            if fy <= y + hh - 2:
+                put(win, fy, ix, tui_fit(footer, iw, G["ell"]),
+                    pal["warn"] | curses.A_BOLD)
 
     # --------------------------------------------------------------- heatmap
     def draw_heatmap(win, y, x, iw, hh, activity, pal):
@@ -5954,7 +7170,7 @@ def run_tui(args):
     # ---------------------------------------------------------------- panels
     def draw_records(win, rect, records, activity, pal):
         y, x, hh, ww = rect
-        box(win, rect, f"Records {G['mid']} 52 weeks", pal["border"],
+        box(win, rect, f"Records {G['mid']} recorded", pal["border"],
             pal["acc"] | curses.A_BOLD)
         iw = ww - 4
         if iw < 8 or hh < 4:
@@ -6145,8 +7361,12 @@ def run_tui(args):
     def draw_recap(win, y, x, hh, ww, pal):
         vis = state["visible"]
         shown_count = sum(1 for key in TUI_HARNESS_KEYS if vis.get(key, True))
-        title = (f"Recap {G['mid']} all harnesses" if shown_count == 3
-                 else f"Recap {G['mid']} {shown_count} of 3 harnesses")
+        if shown_count == 3:
+            title = f"Recap {G['mid']} all harnesses"
+        elif shown_count == 1 and vis.get("opencode", True):
+            title = f"Recap {G['mid']} OpenCode only"
+        else:
+            title = f"Recap {G['mid']} {shown_count} of 3 harnesses"
         box(win, (y, x, hh, ww), title, pal["border"], pal["acc"] | curses.A_BOLD)
         iw = ww - 4
         if iw < 10 or hh < 4:
@@ -6169,11 +7389,18 @@ def run_tui(args):
                              state["R"] if e[1] == "router" else state["C"])["tokens_total"]
             for e in shown
         )
-        put(win, y + 1, ix, f"TOTAL {_fmt(total)}", pal["mag"] | curses.A_BOLD)
+        put(win, y + 1, ix, f"TOTAL recorded {_fmt(total)}", pal["mag"] | curses.A_BOLD)
         put(win, y + 1, ix + 24, f"range {rng}   today {_fmt(today_total)}", pal["muted"])
         put(win, y + 2, ix,
             "   ".join(f"{e[0]} {_fmt(e[2]['tokens_total'] if e[2] else 0)}" for e in shown),
             pal["dim"])
+        split = tui_token_split(state["S"])
+        if (hh >= 5 and vis.get("opencode", True)
+                and split["has_recovered"]):
+            put(win, y + 3, ix,
+                tui_fit(f"Recovered history  {_fmt(split['recovered']['total'])} "
+                        f"(not in totals)", iw, G["ell"]),
+                pal["warn"] | curses.A_BOLD)
         by = y + 4
         denom = total or 1.0
         bx = ix
@@ -6236,12 +7463,20 @@ def run_tui(args):
                 if vis.get("cline", True):
                     lines.append(("Cline", _fmt(cn), "mag"))
                 lines.append(("Today", _fmt(today), "mag"))
+                split = tui_token_split(state["S"])
+                if vis.get("opencode", True) and split["has_recovered"]:
+                    lines.append(("Recovered", _fmt(split["recovered"]["total"]), "warn"))
             else:
                 lines = [("Today", _fmt(tui_today_totals(payload)["tokens_total"]), "mag"),
                          ("Tokens", _fmt(p["tokens_total"]), "acc"),
                          ("Sessions", str(p["sessions"]), "value"),
                          ("Messages", str(p["messages"]), "value"),
                          ("Cost", tui_fmt_cost(p["cost"]), "good")]
+                if tab == 0:
+                    split = tui_token_split(payload)
+                    if split["has_recovered"]:
+                        lines.append(("Recovered",
+                                      _fmt(split["recovered"]["total"]), "warn"))
             yy = 3
             for label, value, key in lines:
                 if yy > h - 3:
@@ -6289,12 +7524,11 @@ def run_tui(args):
         def top_model(yy, models):
             if yy > bottom:
                 return
-            rows = [m for m in (models or []) if isinstance(m, (list, tuple)) and m]
+            rows = tui_visible_models(models)
             if not rows:
                 return
             m = rows[0]
-            badge = (tui_model_badge(m, 12 if tab in (1, 2) else 7)
-                     or tui_recovered_badge(m))
+            badge = tui_model_badge(m, 12 if tab in (1, 2) else 7)
             put(win, yy, ix, "top model", pal["muted"])
             room = iw - 11 - (len(badge) + 1 if badge else 0)
             put(win, yy, ix + 10, tui_fit(str(m[0]), max(6, room), G["ell"]), pal["dim"])
@@ -6324,6 +7558,12 @@ def run_tui(args):
                 kv(yy, name, _fmt(period(src)["tokens_total"]), pal[attr_key] | curses.A_BOLD)
                 yy += 1
             kv(yy, "today", _fmt(today), pal["mag"] | curses.A_BOLD)
+            yy += 1
+            split = tui_token_split(state["S"])
+            if vis.get("opencode", True) and split["has_recovered"]:
+                kv(yy, "recovered",
+                   f"{_fmt(split['recovered']['total'])} meta",
+                   pal["warn"] | curses.A_BOLD)
             return
 
         p = period(payload)
@@ -6340,6 +7580,11 @@ def run_tui(args):
             kv(yy + 3, "cache", _fmt(p["cache"]))
             kv(yy + 4, "cost", tui_fmt_cost(p["cost"]))
             top_model(yy + 5, (payload or {}).get("models"))
+            split = tui_token_split(payload)
+            if split["has_recovered"]:
+                kv(yy + 6, "recovered",
+                   f"{_fmt(split['recovered']['total'])} meta",
+                   pal["warn"] | curses.A_BOLD)
         elif tab == 1:
             kv(yy + 1, "ok", str(p["ok"]))
             kv(yy + 2, "errors", str(p["err"]))
@@ -6445,11 +7690,12 @@ def run_tui(args):
             ("q", "quit the TUI"),
             ("r", "refresh all data (clears caches)"),
             ("o / w", f"open Chrome UI: {web}"),
-            ("1-4, tab, arrows", "switch tabs"),
+            ("1-9 visible tabs", "switch tabs (tab/arrows also cycle)"),
             ("up/down, j/k", "move selection in lists"),
             ("enter", "open the detail modal"),
             ("/ then enter", "filter sessions (esc cancels)"),
             ("t", "cycle range 14d / 30d / 90d / all"),
+            ("i", "insights for this tab"),
             ("h", "show/hide harnesses (saved to the ledger)"),
             ("?", "this help"),
             ("esc", "close modal / clear filter"),
@@ -6459,6 +7705,46 @@ def run_tui(args):
             lines.append(("k", key))
             lines.append(("d", f"    {action}"))
         return {"kind": "help", "title": "Help", "lines": lines, "scroll": 0}
+
+    def insights_modal():
+        """Insights for the active tab; Recap merges the visible harnesses."""
+        tab = state["tab"]
+        if tab == 3:
+            name = "Recap"
+            rows = []
+            for i, key in enumerate(TUI_HARNESS_KEYS):
+                if not state["visible"].get(key, True):
+                    continue
+                src = (state["S"], state["R"], state["C"])[i]
+                for row in tui_insight_rows(src or {}):
+                    row = dict(row)
+                    if row.get("title"):
+                        row["title"] = f"{TUI_HARNESS_NAMES[i]} · {row['title']}"
+                    elif row.get("detail"):
+                        row["detail"] = f"{TUI_HARNESS_NAMES[i]}: {row['detail']}"
+                    rows.append(row)
+            rows = rows[:12]
+        else:
+            payload = {0: state["S"], 1: state["R"], 2: state["C"]}.get(tab)
+            name = TUI_HARNESS_NAMES[tab]
+            rows = tui_insight_rows(payload or {})
+        lines = [("h", f"{name} insights"), ("blank", "")]
+        if not rows:
+            lines.append(("d", "no insights yet — refresh with r"))
+        for row in rows:
+            title = row.get("title") or ""
+            value = row.get("value") or ""
+            detail = row.get("detail") or ""
+            if title:
+                lines.append(("k", f"{title}: {value}" if value else str(title)))
+                if detail:
+                    lines.append(("d", f"    {detail}"))
+            elif detail:
+                lines.append(("d", f"{G['dot']} {detail}"))
+            elif value:
+                lines.append(("d", f"{G['dot']} {value}"))
+        return {"kind": "insights", "title": f"Insights {G['mid']} {name}",
+                "lines": lines, "scroll": 0}
 
     def draw_modal(stdscr, pal):
         m = state["modal"]
@@ -6533,7 +7819,7 @@ def run_tui(args):
                 tui_fit("space/enter toggle   h/esc close", iw), pal["muted"])
         if my + 6 <= my + mh - 2:
             put(stdscr, my + 6, mx + 2,
-                tui_fit("hidden harnesses leave Recap totals", iw), pal["muted"])
+                tui_fit("hidden leave tabs + Recap · x = shown", iw), pal["muted"])
 
     # ------------------------------------------------------------ page bodies
     def draw_body(win, layout, tab, pal):
@@ -6553,8 +7839,11 @@ def run_tui(args):
             draw_chart(win, layout["chart"], chart_rows, pal, rng_label)
         if layout.get("models"):
             cost_idx = 12 if tab in (1, 2) else 7
+            split = tui_token_split(state["S"]) if tab == 0 else None
+            recovered = (split["recovered"]["total"]
+                         if split and split["has_recovered"] else 0.0)
             draw_models(win, layout["models"], (payload or {}).get("models") or [],
-                        pal, cost_idx)
+                        pal, cost_idx, recovered)
         if layout.get("sessions"):
             draw_table(win, layout["sessions"], tab, filtered_rows(tab), pal)
         if layout.get("records"):
@@ -6590,47 +7879,42 @@ def run_tui(args):
 
         layout = tui_layout(w, h)
         state["mode"] = layout["mode"]
-        # tab bar (hidden harnesses stay in place but dimmed)
+        # tab bar: only visible harnesses, numbered positionally
         short = layout["mode"] == "compact" or w < 64
-        labels = ["OC", "CX", "CL", "RC"] if short else tabs
+        items = tui_tab_items(state["visible"])
         x = 1
-        for i, name in enumerate(labels):
-            text = f" {i + 1}{name} " if short else f" {i + 1} {name} "
+        for pos, (idx, name, short_name) in enumerate(items):
+            label = short_name if short else name
+            text = f" {pos + 1}{label} " if short else f" {pos + 1} {label} "
             if x + len(text) > w - 1:
                 break
-            hidden = i < 3 and not state["visible"].get(TUI_HARNESS_KEYS[i], True)
-            if i == tab:
-                attr = pal["tab"] | BOLD
-            elif hidden:
-                attr = pal["muted"] | curses.A_DIM
-            else:
-                attr = pal["muted"]
+            attr = pal["tab"] | BOLD if idx == tab else pal["muted"]
             put(stdscr, 1, x, text, attr)
             x += len(text) + 1
+        hidden_count = sum(1 for key in TUI_HARNESS_KEYS
+                           if not state["visible"].get(key, True))
+        hidden_shown = False
+        if hidden_count:
+            tag = f"+{hidden_count} hidden {G['mid']} h"
+            if x + len(tag) <= w - 1:
+                put(stdscr, 1, x, tag, pal["warn"])
+                x += len(tag) + 1
+                hidden_shown = True
         tabs_end = x
         rng = TUI_RANGES[state["range_idx"]][0]
         right = f"range {rng}"
         live = f"{G['dot']} live"
         live_x = max(1, w - len(live) - 1)
         right_x = live_x - len(right) - 3
-        harness_shown = False
         if w >= 48 and right_x >= tabs_end + 2:
             put(stdscr, 1, right_x, right, pal["dim"])
             if live_x >= right_x + len(right) + 2:
                 put(stdscr, 1, live_x, live, pal["good"] | BOLD)
         elif w >= 20 and live_x >= tabs_end + 2:
             put(stdscr, 1, live_x, live, pal["good"] | BOLD)
-        hidden_count = sum(1 for key in TUI_HARNESS_KEYS if not state["visible"].get(key, True))
-        harness_txt = ""
-        if hidden_count and w >= 48:
-            harness_txt = f"harness {3 - hidden_count}/3"
-            harness_x = right_x - len(harness_txt) - 3
-            if harness_x >= tabs_end + 2:
-                put(stdscr, 1, harness_x, harness_txt, pal["warn"])
-                harness_shown = True
         if state.get("filter") and w >= 48:
             tag = f"filter:{tui_fit(state['filter'], 12, G['ell'])}"
-            tag_x = right_x - len(tag) - 2 - (len(harness_txt) + 3 if harness_shown else 0)
+            tag_x = right_x - len(tag) - 2
             if tag_x >= tabs_end + 2:
                 put(stdscr, 1, tag_x, tag, pal["warn"])
 
@@ -6645,28 +7929,32 @@ def run_tui(args):
 
         # footer
         put(stdscr, h - 2, 0, G["h"] * max(0, w - 1), pal["muted"])
-        parts = ["q quit", "r refresh", "o web UI", "t range", "/ search", "? help",
-                 "h harness"]
+        parts = ["q quit", "r refresh", "o web UI", "t range", "/ search",
+                 "i insights", "? help", "h harness"]
         if w >= 100:
             parts[2] = f"o {state['url']}" if state["url"] else "o web UI off"
         elif w < 80:
             # 70-79 cols: the full hint list does not fit on one line
-            parts = ["q quit", "r refresh", "t range", "/ search", "? help", "h harness"]
+            parts = ["q quit", "r refresh", "t range", "/ search",
+                     "i insights", "? help", "h harness"]
         if w < 36:
             parts = ["q quit", "? help", "h harness"]
         elif w < 64:
-            parts = ["q quit", "r refresh", "? help", "h harness"]
-        while "h harness" in parts and len(" " + G["sep"].join(parts) + " ") > w - 1:
-            parts.remove("h harness")
-        if hidden_count and not harness_shown:
-            n_vis = 3 - hidden_count
-            for tag in (f"harness {n_vis}/3", f"h {n_vis}/3"):
+            parts = ["q quit", "r refresh", "i insights", "? help", "h harness"]
+        for optional in ("h harness", "i insights"):
+            while (optional in parts
+                   and len(" " + G["sep"].join(parts) + " ") > w - 1):
+                parts.remove(optional)
+        if hidden_count and not hidden_shown:
+            for tag in (f"+{hidden_count} hidden {G['mid']} h",
+                        f"+{hidden_count} hidden"):
                 if len(" " + G["sep"].join(parts + [tag]) + " ") <= w - 1:
                     parts.append(tag)
                     break
             else:
                 parts = [p for p in parts if p != "h harness"]
-                for tag in (f"harness {n_vis}/3", f"h {n_vis}/3"):
+                for tag in (f"+{hidden_count} hidden {G['mid']} h",
+                            f"+{hidden_count} hidden"):
                     if len(" " + G["sep"].join(parts + [tag]) + " ") <= w - 1:
                         parts.append(tag)
                         break
@@ -6723,8 +8011,20 @@ def run_tui(args):
         msg = f"{spin} Loading dashboard…"
         put(stdscr, max(0, h // 2), max(1, (w - len(msg)) // 2), msg,
             pal["acc"] | curses.A_BOLD)
-        put(stdscr, max(0, h // 2 + 2), max(1, (w - 40) // 2),
-            "reading OpenCode, Codex and Cline data", pal["muted"])
+        shown_names = [TUI_HARNESS_NAMES[i] for i, key in enumerate(TUI_HARNESS_KEYS)
+                       if state["visible"].get(key, True)]
+        if len(shown_names) == 1:
+            reading = f"reading {shown_names[0]} data"
+        elif len(shown_names) == 2:
+            reading = f"reading {shown_names[0]} and {shown_names[1]} data"
+        elif shown_names:
+            reading = (f"reading {shown_names[0]}, {shown_names[1]} "
+                       f"and {shown_names[2]} data")
+        else:
+            reading = "reading OpenCode data"
+        reading = tui_fit(reading, max(8, w - 4), G["ell"])
+        put(stdscr, max(0, h // 2 + 2), max(1, (w - len(reading)) // 2),
+            reading, pal["muted"])
         stdscr.refresh()
 
     # --------------------------------------------------------------- actions
@@ -6889,6 +8189,8 @@ def run_tui(args):
                 cycle_range()
             elif key == ord("?"):
                 state["modal"] = help_modal()
+            elif key in (ord("i"), ord("I")):
+                state["modal"] = insights_modal()
             elif key in (ord("h"), ord("H")):
                 state["modal"] = {"kind": "harness", "title": "Harnesses",
                                   "sel": 0, "scroll": 0, "lines": []}
@@ -6898,12 +8200,12 @@ def run_tui(args):
                 tab_step(1)
             elif key == curses.KEY_LEFT:
                 tab_step(-1)
-            elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
-                idx = key - ord("1")
-                if idx in visible_order():
-                    state["tab"] = idx
+            elif ord("1") <= key <= ord("9"):
+                idx = tui_tab_for_key(key, state["visible"])
+                if idx is None:
+                    state["status"] = "no tab there — press h to show a harness"
                 else:
-                    state["status"] = f"{tabs[idx]} is hidden — press h to show it"
+                    state["tab"] = idx
             elif key in (curses.KEY_UP, ord("k")):
                 move_sel(-1)
             elif key in (curses.KEY_DOWN, ord("j")):
@@ -6952,8 +8254,9 @@ def main():
                         help="path to Cline Desktop data dir (sessions + db)")
     parser.add_argument(
         "--recovered-tokens", type=int, default=None, metavar="N",
-        help=(f"recovered OpenCode tokens to attribute to an 'Other' model row "
-              f"(default {RECOVERED_OPENCODE_TOKENS:,} for the default db; 0 disables)"),
+        help=(f"recovered OpenCode tokens shown as lifetime metadata and "
+              f"excluded from recorded totals (default {RECOVERED_OPENCODE_TOKENS:,} "
+              f"for the default db; 0 disables)"),
     )
     args = parser.parse_args()
 

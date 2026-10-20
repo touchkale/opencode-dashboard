@@ -276,9 +276,13 @@ def test_query_stats_opencode_2_0_schema(tmp_path):
     assert row[1] == 5
     assert row[2] == 1800
     assert row[7] == pytest.approx(0.005)
-    # per-day token totals come from parts of session_v2 sessions only:
-    # 5 step-finish parts x 400 total tokens (legacy 1.8M part excluded)
-    assert sum(day["total"] for day in stats["days"]) == pytest.approx(2000)
+    # per-day token totals come from parts of session_v2 sessions only and
+    # must reconcile with the recorded total: 5 sessions x 360 tokens
+    # (5 step-finish parts report 400, scaled down to each session total).
+    assert sum(day["total"] for day in stats["days"]) == pytest.approx(1800)
+    assert sum(day["total"] for day in stats["days"]) == pytest.approx(
+        stats["totals"]["tokens_total"]
+    )
     assert sum(day["msgs"] for day in stats["days"]) == 10
     assert sum(day["sessions"] for day in stats["days"]) == 5
     # file attribution is filtered the same way: only the v2 file is reported
@@ -743,30 +747,29 @@ def _recovered_stats():
     }
 
 
-def test_apply_recovered_adjustment_ratio_exact_sum_and_other_row():
+def test_apply_recovered_adjustment_metadata_only_exact_sum():
     stats = _recovered_stats()
     before = json.loads(json.dumps(stats))
     out = d.apply_recovered_adjustment(stats, 1000)
-    t = out["totals"]
-    # base ratio 100/50/10/30/10 of 200 -> exactly 500/250/50/150/50 of 1000
-    assert t["tokens_input"] == 600
-    assert t["tokens_output"] == 300
-    assert t["tokens_reasoning"] == 60
-    assert t["tokens_cache_read"] == 180
-    assert t["tokens_cache_write"] == 60
-    assert t["tokens_total"] == 1200
-    assert t["cache_rate"] == d.cache_rate(600, 180)
-    assert t["avg_tokens_per_session"] == 300  # 1200 / 4 sessions
+    # recorded totals stay exactly as recorded
+    assert out["totals"] == before["totals"]
+    assert out["models"] == before["models"]
+    assert all(m[0] != "Other" for m in out["models"])
+    # recovered is exposed as lifetime-only metadata, split in the recorded ratio
     assert out["recovered"] == {
         "tokens_total": 1000, "tokens_input": 500, "tokens_output": 250,
-        "tokens_reasoning": 50, "tokens_cache": 200, "model": "Other",
+        "tokens_reasoning": 50, "tokens_cache": 200,
+        "included_in_totals": False,
     }
-    other = [m for m in out["models"] if m[0] == "Other"][0]
-    assert other[1] == 0 and other[2] == 1000
-    assert (other[3], other[4], other[5], other[6]) == (500, 250, 50, 200)
-    assert other[7] == 0 and other[8] == 0
-    assert other[9] == d.cache_rate(500, 200)
-    assert out["models"][0][0] == "Other"  # sorted by total desc
+    life = out["lifetime"]
+    assert life["recorded_total"] == 200
+    assert life["recovered_total"] == 1000
+    assert life["tokens_total"] == 1200
+    assert life["tokens_input"] == 600
+    assert life["tokens_output"] == 300
+    assert life["tokens_reasoning"] == 60
+    assert life["tokens_cache"] == 240  # recorded 30+10 + recovered 200
+    assert life["cost"] == 1.5
     # days/activity/records/range/agents/projects are intentionally untouched
     assert out["days"] == before["days"]
     assert out["activity"] == before["activity"]
@@ -776,7 +779,7 @@ def test_apply_recovered_adjustment_ratio_exact_sum_and_other_row():
     assert out["projects"] == before["projects"]
 
 
-def test_apply_recovered_adjustment_rounding_and_merging():
+def test_apply_recovered_adjustment_rounding_and_replacement():
     stats = _recovered_stats()
     # ratios 3/2/1/1/1 (sum 8) with amount 101: rounding must still sum to 101
     stats["totals"].update({"tokens_input": 3, "tokens_output": 2,
@@ -787,13 +790,16 @@ def test_apply_recovered_adjustment_rounding_and_merging():
     parts_sum = (rec["tokens_input"] + rec["tokens_output"] + rec["tokens_reasoning"]
                  + rec["tokens_cache"])
     assert parts_sum == 101
-    assert out["totals"]["tokens_total"] == 8 + 101
-    # merging a second call into the same payload adds to the Other row
+    assert rec["tokens_total"] == 101
+    assert out["totals"]["tokens_total"] == 8  # recorded totals untouched
+    assert out["lifetime"]["tokens_total"] == 8 + 101
+    assert all(m[0] != "Other" for m in out["models"])
+    # a second call replaces the recovered metadata instead of accumulating
     out = d.apply_recovered_adjustment(out, 50)
-    other = [m for m in out["models"] if m[0] == "Other"]
-    assert len(other) == 1
-    assert other[0][2] == 151
     assert out["recovered"]["tokens_total"] == 50
+    assert out["lifetime"]["tokens_total"] == 8 + 50
+    assert out["lifetime"]["recovered_total"] == 50
+    assert all(m[0] != "Other" for m in out["models"])
 
 
 def test_apply_recovered_adjustment_noop_cases():
@@ -818,9 +824,8 @@ def test_recovered_tokens_auto_default_db_and_explicit_override(tmp_path, monkey
         d.LOCAL_CACHE.clear()
     auto = d.cached_local_stats(db)
     assert auto["recovered"]["tokens_total"] == d.RECOVERED_OPENCODE_TOKENS
-    assert auto["totals"]["tokens_total"] > d.RECOVERED_OPENCODE_TOKENS
-    other = [m for m in auto["models"] if m[0] == "Other"][0]
-    assert other[2] == d.RECOVERED_OPENCODE_TOKENS
+    assert auto["totals"]["tokens_total"] < d.RECOVERED_OPENCODE_TOKENS
+    assert all(m[0] != "Other" for m in auto["models"])
 
     # a different default path -> no auto adjustment
     monkeypatch.setattr(d, "DB_PATH", Path(tmp_path / "other-default.db"))
@@ -829,6 +834,10 @@ def test_recovered_tokens_auto_default_db_and_explicit_override(tmp_path, monkey
     plain = d.cached_local_stats(db)
     assert "recovered" not in plain
     assert all(m[0] != "Other" for m in plain["models"])
+    # recovered is metadata only: recorded totals are identical either way
+    assert auto["totals"] == plain["totals"]
+    assert auto["models"] == plain["models"]
+    assert auto["lifetime"]["recorded_total"] == plain["totals"]["tokens_total"]
 
     # explicit positive value overrides for any db
     monkeypatch.setattr(d, "RECOVERED_TOKENS", 5000)
