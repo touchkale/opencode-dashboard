@@ -2785,14 +2785,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .subview>.hero:first-child+.kpis{margin-top:22px}
 
 /* hero */
-.hero{padding:52px 0 14px}
+.hero{padding:40px 0 10px}
 .hero .eyebrow{font-family:var(--mono);font-size:11.5px;color:var(--subtle);letter-spacing:.12em;text-transform:uppercase}
-.hero h1{font-size:clamp(26px,4vw,38px);font-weight:800;letter-spacing:-.035em;line-height:1.12;margin-top:10px;max-width:720px}
+.hero h1{font-size:clamp(25px,3.4vw,34px);font-weight:800;letter-spacing:-.035em;line-height:1.08;margin-top:8px;max-width:720px}
 .hero h1 b{font-weight:800;background:linear-gradient(100deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
-.hero .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.hero .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 .pill{font-family:var(--mono);font-size:11px;background:var(--panel);border:1px solid var(--line);color:var(--muted);
   padding:5px 12px;border-radius:999px}
-.hero-note{font-family:var(--mono);font-size:11.5px;color:var(--subtle);margin-top:10px;line-height:1.6}
+.hero-note{font-family:var(--mono);font-size:11.5px;color:var(--subtle);margin-top:8px;line-height:1.6}
 .hero-note b{color:var(--text);font-weight:700}
 .recovered-note{font-size:12px;color:var(--muted);line-height:1.6;background:var(--panel);border:1px dashed var(--line);
   border-radius:12px;padding:12px 15px;margin-top:12px}
@@ -2828,6 +2828,8 @@ h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-wei
 @media(max-width:900px){.grid2{grid-template-columns:1fr}}
 .chart-card .ctitle{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--subtle);margin-bottom:12px}
 .chart-card .ctitle small{font-weight:500;letter-spacing:0;text-transform:none;color:var(--subtle);margin-left:8px}
+.chart-card .gridline{stroke:var(--line);stroke-width:1;opacity:.75}
+.chart-card .ylab{fill:var(--subtle);font-family:var(--mono);letter-spacing:.02em}
 
 /* insight cards */
 .insights{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:20px}
@@ -3283,15 +3285,15 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 
   <section class="kpis" id="kpis"></section>
 
-  <h2 class="sec">Notes on your usage <span class="hint" id="notes-hint">generated from your local data</span></h2>
-  <section class="insights" id="insights"></section>
-
   <h2 class="sec" id="sec-tokens">Tokens per day <span class="hint">input · output incl. reasoning · cache · click a day to filter</span></h2>
   <div class="card chart-card">
     <div class="ctitle">Tokens per day <small id="tok-sub">stacked absolute</small></div>
     <div id="tok-chart"></div>
     <div class="legend" id="tok-legend"></div>
   </div>
+
+  <h2 class="sec">Notes on your usage <span class="hint" id="notes-hint">generated from your local data</span></h2>
+  <section class="insights" id="insights"></section>
   </div><!-- /subview overview -->
 
   <div class="subview" data-sub="code">
@@ -3580,10 +3582,20 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 const $=id=>document.getElementById(id);
 const ESC=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const BOLD=s=>{const ents=[];const t=s.replace(/&(?:#\d+|[a-z]+);/g,m=>{ents.push(m);return'@@'+String.fromCharCode(65+ents.length-1)+'@@';});
-  return t.replace(/(\d[\d,]*(?:\.\d+)?)/g,'<b>$1</b>').replace(/@@[A-Z]+@@/g,m=>ents[m.charCodeAt(2)-65]);};
+  return t.replace(/(\d[\d,]*(?:\.\d+)?(?:[KMB])?)/g,'<b>$1</b>').replace(/@@[A-Z]+@@/g,m=>ents[m.charCodeAt(2)-65]);};
 const F=n=>{const s=Math.round(Number(n)||0).toString();return s.replace(/\B(?=(\d{3})+(?!\d))/g,',');};
 const FN=n=>{n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
 const FB=n=>{n=Number(n)||0;return n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
+/* axis ticks: 0, 275M, 550M, 825M, 1.10B — compact but not noisy */
+const FA=n=>{n=Number(n)||0;if(!n)return'0';
+  if(n>=1e9)return (n/1e9).toFixed(2)+'B';
+  if(n>=1e6){const v=n/1e6;return (v<10?v.toFixed(2).replace(/0+$/,'').replace(/\.$/,''):String(Math.round(v)))+'M';}
+  if(n>=1e3){const v=n/1e3;return (v<10?v.toFixed(1).replace(/\.0$/,''):String(Math.round(v)))+'K';}
+  return String(Math.round(n));};
+/* prose formatter for generated notes: compact token amounts + singular units */
+const FT=s=>String(s??'')
+  .replace(/(\d[\d,]*(?:\.\d+)?)\s+(?=(?:cache\s+)?tokens\b)/g,(m,n)=>FB(n.replace(/,/g,''))+' ')
+  .replace(/\b1 (session|message|model|agent|commit)s\b/g,'1 $1');
 const DT=t=>{if(!t)return'—';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 const DS=t=>{if(!t)return'';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA');};
 const DUR=m=>{if(m==null)return'—';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
@@ -3709,14 +3721,22 @@ function stackChart(days){
   const keys=SPLIT?[{p:'ti',c:t.accent,l:'Input'},{p:'to',c:t.accent2,l:'Output'},{p:'tr',c:t.reason,l:'Reasoning'},{p:'cache',c:t.cache,l:'Cache'}]
                    :[{p:'ti',c:t.accent,l:'Input'},{p:'out',c:t.accent2,l:'Output incl. reasoning'},{p:'cache',c:t.cache,l:'Cache'}];
   const val=(d,k)=>k.p==='out'?outMerged(d):(d[k.p]||0);
-  const w=980,h=250,p=34;
+  const w=980,h=190,pL=58,pR=14,pT=12,pB=24;
   let max=1;
   if(SHARE){max=100;}
   else{max=Math.max(...days.map(d=>keys.reduce((a,k)=>a+val(d,k),0)),1);}
-  const Y=v=>p+(1-v/max)*(h-2*p),X=i=>days.length>1?p+i*(w-2*p)/(days.length-1):p+(w-2*p)/2;
-  const slot=(w-2*p)/Math.max(days.length,1);
-  const sw=Math.min(slot*0.32,p*0.85);
+  const plotW=w-pL-pR;
+  const Y=v=>pT+(1-v/max)*(h-pT-pB),X=i=>days.length>1?pL+i*plotW/(days.length-1):pL+plotW/2;
+  const slot=plotW/Math.max(days.length,1);
+  const sw=Math.min(slot*0.32,24);
   const step=Math.ceil(days.length/12)||1;
+  /* y-axis: four bands (0/25/50/75/100% of max) behind the bars */
+  let grid='';
+  for(let i=0;i<=4;i++){
+    const v=max*i/4,y=Y(v);
+    grid+=svg('line',{x1:pL,y1:y.toFixed(1),x2:(w-pR).toFixed(1),y2:y.toFixed(1),class:'gridline','vector-effect':'non-scaling-stroke'});
+    grid+=svg('text',{x:pL-9,y:(y+3.4).toFixed(1),'text-anchor':'end',class:'ylab','font-size':10},SHARE?Math.round(v)+'%':FA(v));
+  }
   let cells='',xl='';
   days.forEach((day,i)=>{
     const tot=keys.reduce((a,k)=>a+val(day,k),0);
@@ -3726,7 +3746,6 @@ function stackChart(days){
       let v=val(day,k), y0,y1;
       if(SHARE){
         const pct=tot?v/tot*100:0;
-        y1=Y(acc+((k===keys[0])?0:0)); // placeholder
         const share0=acc/tot*100||0;
         acc+=v;
         const share1=acc/tot*100||0;
@@ -3745,14 +3764,14 @@ function stackChart(days){
         acc+=v;
       }
     });
-    cells+=svg('rect',{x:(X(i)-slot/2).toFixed(1),y:p,width:(slot*0.96).toFixed(1),height:(h-2*p).toFixed(1),fill:'transparent',
+    cells+=svg('rect',{x:(X(i)-slot/2).toFixed(1),y:pT,width:(slot*0.96).toFixed(1),height:(h-pT-pB).toFixed(1),fill:'transparent',
       class:'inter'+dayDim(day),'data-tip':dayTip(day),'data-f':'day|'+day.date,tabindex:'0',role:'button',
       'aria-label':day.date+', '+FN(dayTotal(day))+' tokens, filter by day'});
-    if(i%step===0)xl+=svg('text',{x:X(i).toFixed(1),y:h-p+17,'text-anchor':'middle',fill:'#9a968c','font-size':10},day.date.slice(5));
+    if(i%step===0)xl+=svg('text',{x:X(i).toFixed(1),y:h-pB+16,'text-anchor':'middle',fill:'#9a968c','font-size':10},day.date.slice(5));
   });
   const sub=$('tok-sub');
   if(sub)sub.textContent=(SHARE?'100% share':'stacked absolute')+(SPLIT?' · reasoning split':' · output merged');
-  return '<svg viewBox="0 0 '+w+' '+(h+10)+'" width="100%">'+cells+xl+'</svg>';
+  return '<svg viewBox="0 0 '+w+' '+(h+6)+'" width="100%">'+grid+cells+xl+'</svg>';
 }
 function shortPath(p){const seg=(p||'').split('/').filter(Boolean);return seg.length>2?'…/'+seg.slice(-2).join('/'):p;}
 function fileRows(){
@@ -3868,7 +3887,7 @@ function renderAll(){
 function renderHero(){
   const periodLbl=RANGE==='all'?'':(RANGE==='365'?'12 MO':(RANGE/30>=1?Math.round(RANGE/30)+' MO':RANGE+' DAYS'));
   $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+(periodLbl?' · LAST '+periodLbl:'')+' · REFRESHES AUTOMATICALLY';
-  $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
+  $('headline').innerHTML=BOLD(ESC(FT(S.insights[0]||'No activity yet.')));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
   const ltitle=last?ESC(last.title):'—';
   const nModels=S.models.length;
@@ -3962,7 +3981,7 @@ function renderRecords(){
 }
 function renderInsights(){
   $('notes-hint').textContent=RANGE==='all'?'generated from your local data':'all-time notes · charts/tables follow the period filter';
-  $('insights').innerHTML=S.insights.slice(1,5).map(ins=>'<div class="in"><p>'+BOLD(ESC(ins))+'</p></div>').join('');
+  $('insights').innerHTML=S.insights.slice(1,5).map(ins=>'<div class="in"><p>'+BOLD(ESC(FT(ins)))+'</p></div>').join('');
 }
 function renderCharts(){
   const d=periodDays();
